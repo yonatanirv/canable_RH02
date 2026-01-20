@@ -112,11 +112,13 @@ int8_t slcan_parse_str(uint8_t *buf, uint8_t len)
 		case 'O':
 			// Open channel command
 			can_enable();
+			CDC_Transmit_FS((uint8_t*)"\r", 1);  // Standard SLCAN: CR for success
 			return 0;
 
 		case 'C':
 			// Close channel command
 			can_disable();
+			CDC_Transmit_FS((uint8_t*)"\r", 1);  // Standard SLCAN: CR for success
 			return 0;
 
 		case 'S':
@@ -125,10 +127,12 @@ int8_t slcan_parse_str(uint8_t *buf, uint8_t len)
 			// Check for valid bitrate
 			if(buf[1] >= CAN_BITRATE_INVALID)
 			{
+				CDC_Transmit_FS((uint8_t*)"\a", 1);  // Standard SLCAN: BEL for error
 				return -1;
 			}
 
 			can_set_bitrate(buf[1]);
+			CDC_Transmit_FS((uint8_t*)"\r", 1);  // Standard SLCAN: CR for success
 			return 0;
 
 		case 'm':
@@ -173,6 +177,27 @@ int8_t slcan_parse_str(uint8_t *buf, uint8_t len)
 			snprintf_(errstr, 64, "CANable Error Register: %X", (unsigned int)error_reg());
 			CDC_Transmit_FS((uint8_t*)errstr, strlen(errstr));
 	        return 0;
+		}
+
+		// Nonstandard: Get CAN status flags
+		case 'F':
+		{
+			can_status_t status;
+			can_get_status(&status);
+			
+			// Format: F:bus,ewarn,epass,boff,lec,tec,rec
+			// lec: 0=none,1=stuff,2=form,3=ack,4=bitr,5=bitd,6=crc
+			char statstr[64] = {0};
+			snprintf_(statstr, 64, "F:%d,%d,%d,%d,%d,%d,%d\r",
+				status.bus_state,
+				status.error_warning,
+				status.error_passive,
+				status.bus_off,
+				status.last_error,
+				status.tx_err_cnt,
+				status.rx_err_cnt);
+			CDC_Transmit_FS((uint8_t*)statstr, strlen(statstr));
+			return 0;
 		}
 
 		case 'T':
@@ -226,6 +251,7 @@ int8_t slcan_parse_str(uint8_t *buf, uint8_t len)
 
     // Transmit the message
     can_tx(&frame_header, frame_data);
+    // Note: No response sent for TX to avoid flooding serial buffer at high rates
 
     return 0;
 }

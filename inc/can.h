@@ -35,6 +35,28 @@ typedef struct cantxbuf_
 } can_txbuf_t;
 
 
+// CAN Error Status structure
+typedef struct can_status_
+{
+    uint8_t bus_state;      // 0=off, 1=on
+    uint8_t error_warning;  // Error warning flag (TEC or REC >= 96)
+    uint8_t error_passive;  // Error passive flag (TEC or REC >= 128)
+    uint8_t bus_off;        // Bus-off flag (TEC >= 256)
+    uint8_t last_error;     // Last error code: 0=none, 1=stuff, 2=form, 3=ack, 4=bit_rec, 5=bit_dom, 6=crc
+    uint8_t tx_err_cnt;     // Transmit error counter
+    uint8_t rx_err_cnt;     // Receive error counter
+} can_status_t;
+
+// Last Error Code values
+#define CAN_LEC_NONE      0  // No error
+#define CAN_LEC_STUFF     1  // Stuff error
+#define CAN_LEC_FORM      2  // Form error
+#define CAN_LEC_ACK       3  // Acknowledgment error (no ACK received)
+#define CAN_LEC_BIT_REC   4  // Bit recessive error
+#define CAN_LEC_BIT_DOM   5  // Bit dominant error
+#define CAN_LEC_CRC       6  // CRC error
+
+
 // Prototypes
 void can_init(void);
 void can_enable(void);
@@ -44,6 +66,7 @@ void can_set_silent(uint8_t silent);
 void can_set_autoretransmit(uint8_t autoretransmit);
 uint32_t can_tx(CAN_TxHeaderTypeDef *tx_msg_header, uint8_t *tx_msg_data);
 uint32_t can_rx(CAN_RxHeaderTypeDef *rx_msg_header, uint8_t *rx_msg_data);
+void can_get_status(can_status_t *status);
 
 
 void can_process(void);

@@ -222,6 +222,12 @@ void cdc_process(void)
 // TODO: Do some buffering here. Try to transmit 64byte packets.
 uint8_t CDC_Transmit_FS(uint8_t* Buf, uint16_t Len)
 {
+    // Check if USB is initialized
+    if(hUsbDeviceFS.pClassData == NULL)
+    {
+        return USBD_FAIL;
+    }
+    
     // Attempt to transmit on USB, wait until not busy
     // Future: implement TX buffering
     uint32_t start_wait = HAL_GetTick();

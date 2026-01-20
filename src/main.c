@@ -22,7 +22,14 @@ int main(void)
     led_init();
     usb_init();
 
-    led_blue_blink(2);
+    // Boot LED sequence: RX 3x, then TX 3x
+    led_rx_blink(3);   // RX first
+    HAL_Delay(200);
+    led_tx_blink(3);   // TX second
+    
+    // Turn both LEDs off after boot sequence
+    led_rx_off();
+    led_tx_off();
 
     // Storage for status and received message buffer
     CAN_RxHeaderTypeDef rx_msg_header;
@@ -47,7 +54,12 @@ int main(void)
 				// Transmit message via USB-CDC
 				if(msg_len)
 				{
-					CDC_Transmit_FS(msg_buf, msg_len);
+					uint8_t result = CDC_Transmit_FS(msg_buf, msg_len);
+					if(result != 0) // USBD_OK = 0
+					{
+						// USB busy - blink TX LED to show dropped frame
+						led_tx_on();
+					}
 				}
 			}
         }

@@ -1,24 +1,32 @@
 #ifndef _LED_H
 #define _LED_H
 
+#include <stdint.h>
 
-#define LED_BLUE_Pin GPIO_PIN_1
-#define LED_BLUE_Port GPIOB
-#define LED_BLUE LED_BLUE_Port , LED_BLUE_Pin
+// Based on RH02 board observation:
+// PB1 = TX LED (blinks first currently)
+// PB0 = RX LED (blinks second currently)
 
-#define LED_GREEN_Pin GPIO_PIN_0
-#define LED_GREEN_Port GPIOB
-#define LED_GREEN LED_GREEN_Port , LED_GREEN_Pin
+// TX LED - PB1
+#define LED_TX_Pin GPIO_PIN_1
+#define LED_TX_Port GPIOB
+#define LED_TX LED_TX_Port, LED_TX_Pin
 
+// RX LED - PB0
+#define LED_RX_Pin GPIO_PIN_0
+#define LED_RX_Port GPIOB
+#define LED_RX LED_RX_Port, LED_RX_Pin
 
 
 #define LED_DURATION 25 
 
-void led_init();
-void led_blue_blink(uint8_t numblinks);
-void led_green_on(void);
-void led_green_off(void);
-void led_blue_on(void);
+void led_init(void);
+void led_tx_on(void);
+void led_tx_off(void);
+void led_tx_blink(uint8_t numblinks);
+void led_rx_on(void);
+void led_rx_off(void);
+void led_rx_blink(uint8_t numblinks);
 void led_process(void);
 
 #endif

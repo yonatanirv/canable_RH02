@@ -84,7 +84,7 @@ void can_enable(void)
         HAL_CAN_Start(&can_handle);
         bus_state = ON_BUS;
 
-        led_blue_on();
+        led_rx_on();
     }
 }
 
@@ -98,7 +98,7 @@ void can_disable(void)
     	can_handle.Instance->MCR |= CAN_MCR_RESET;
         bus_state = OFF_BUS;
 
-        led_green_on();
+        led_tx_on();
     }
 }
 
@@ -147,7 +147,7 @@ void can_set_bitrate(enum can_bitrate bitrate)
             break;
     }
 
-    led_green_on();
+    led_tx_on();
 }
 
 
@@ -166,7 +166,7 @@ void can_set_silent(uint8_t silent)
     	can_handle.Init.Mode = CAN_MODE_NORMAL;
     }
 
-    led_green_on();
+    led_tx_on();
 }
 
 
@@ -185,7 +185,7 @@ void can_set_autoretransmit(uint8_t autoretransmit)
     	can_autoretransmit = DISABLE;
     }
 
-    led_green_on();
+    led_tx_on();
 }
 
 
@@ -225,7 +225,7 @@ void can_process(void)
 		uint32_t status = HAL_CAN_AddTxMessage(&can_handle, &txqueue.header[txqueue.tail], txqueue.data[txqueue.tail], &mailbox_txed);
 		txqueue.tail = (txqueue.tail + 1) % TXQUEUE_LEN;
 
-		led_green_on();
+		led_tx_on();
 
 		// This drops the packet if it fails (no retry). Failure is unlikely
 		// since we check if there is a TX mailbox free.
@@ -241,7 +241,7 @@ void can_process(void)
 uint32_t can_rx(CAN_RxHeaderTypeDef *rx_msg_header, uint8_t* rx_msg_data)
 {
     uint32_t status = HAL_CAN_GetRxMessage(&can_handle, CAN_RX_FIFO0, rx_msg_header, rx_msg_data);
-	led_blue_on();
+	led_rx_on();
     return status;
 }
 
@@ -261,6 +261,30 @@ uint8_t is_can_msg_pending(uint8_t fifo)
 CAN_HandleTypeDef* can_gethandle(void)
 {
 	return &can_handle;
+}
+
+
+// Get CAN bus status including error information
+void can_get_status(can_status_t *status)
+{
+    if (status == NULL) return;
+    
+    status->bus_state = (bus_state == ON_BUS) ? 1 : 0;
+    
+    // Read Error Status Register (ESR)
+    uint32_t esr = can_handle.Instance->ESR;
+    
+    // Error flags
+    status->error_warning = (esr & CAN_ESR_EWGF) ? 1 : 0;  // Error Warning Flag
+    status->error_passive = (esr & CAN_ESR_EPVF) ? 1 : 0;  // Error Passive Flag
+    status->bus_off = (esr & CAN_ESR_BOFF) ? 1 : 0;        // Bus-Off Flag
+    
+    // Last Error Code (LEC bits 4-6)
+    status->last_error = (esr >> 4) & 0x07;
+    
+    // Error counters (TEC bits 16-23, REC bits 24-31)
+    status->tx_err_cnt = (esr >> 16) & 0xFF;
+    status->rx_err_cnt = (esr >> 24) & 0xFF;
 }
 
 
