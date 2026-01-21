@@ -23,47 +23,42 @@ class Receiver:
         self._start_time: Optional[float] = None
         self._last_frame_time: Optional[float] = None
         self._stall_timeout = 30.0  # Seconds without frames before recovery attempt
+        # Status queries corrupt frame reception in SLCAN (shared serial channel)
+        # So we only show frame count inline, not device status
+        self._last_status_time: Optional[float] = None
+        self._status_interval = 5.0  # Show status summary every N seconds (when no frames)
 
     def _get_status_str(self) -> str:
-        """Get compact status string for inline display."""
+        """Get compact status string for inline display.
+        
+        NOTE: For RX mode, we don't query device status inline because
+        the SLCAN status query (F command) corrupts the receive buffer.
+        We only show frame count here.
+        """
         if not self.show_status:
             return ""
         
-        status = self.device.get_status()
-        if status is None:
-            return " | Status: N/A"
-        
-        # Compact format: TEC:X REC:X [ERR]
-        parts = [f"TEC:{status.tx_err_cnt}", f"REC:{status.rx_err_cnt}"]
-        
-        if status.last_error != 0:
-            parts.append(f"Err:{status.last_error_str}")
-        
-        if status.bus_off:
-            parts.append("[BUS-OFF]")
-        elif status.error_passive:
-            parts.append("[PASSIVE]")
-        elif status.error_warning:
-            parts.append("[WARN]")
-        
-        return " | " + " ".join(parts)
+        # Don't query device status during active reception - it corrupts the buffer!
+        # Just show that status display is enabled (actual status shown at summary)
+        return ""
 
     def start(self) -> None:
         """Start receiving CAN frames continuously."""
         self._running = True
         self._frame_count = 0
         self._start_time = time.time()
+        self._last_status_time = time.time()
 
         original_handler = signal.signal(signal.SIGINT, self._signal_handler)
 
         print(f"\n[RX] Listening for CAN frames...")
-        print(f"[RX] Press Ctrl+C to stop\n")
-        print("-" * 100)
-        header = f"{'#':>6}  {'Time':<10}  {'ID':<11}  {'DLC':<4}  {'Data':<24}"
         if self.show_status:
-            header += "  Status"
+            print(f"[RX] Status will be shown at summary (inline status disabled to avoid buffer corruption)")
+        print(f"[RX] Press Ctrl+C to stop\n")
+        print("-" * 80)
+        header = f"{'#':>6}  {'Time':<10}  {'ID':<11}  {'DLC':<4}  {'Data':<24}"
         print(header)
-        print("-" * 100)
+        print("-" * 80)
 
         try:
             while self._running:
@@ -92,13 +87,12 @@ class Receiver:
             self._print_summary()
 
     def _print_frame(self, frame: CanFrame) -> None:
-        """Print a received frame with optional status."""
+        """Print a received frame."""
         elapsed = time.time() - self._start_time
         id_str = f"0x{frame.arbitration_id:08X}" if frame.is_extended_id else f"0x{frame.arbitration_id:03X}"
         data_str = frame.to_hex_string()
-        status_str = self._get_status_str()
         
-        print(f"{self._frame_count:6d}  {elapsed:>8.3f}s  {id_str:<11}  {len(frame.data):<4}  {data_str:<24}{status_str}")
+        print(f"{self._frame_count:6d}  {elapsed:>8.3f}s  {id_str:<11}  {len(frame.data):<4}  {data_str:<24}")
 
     def _try_recovery(self) -> None:
         """Attempt to recover from stalled state."""
@@ -123,14 +117,18 @@ class Receiver:
         duration = time.time() - self._start_time if self._start_time else 0
         rate = self._frame_count / duration if duration > 0 else 0
 
-        print("-" * 100)
+        print("-" * 80)
         print(f"\n[RX] Summary: {self._frame_count} frames in {duration:.2f}s ({rate:.1f} frames/sec)")
         
-        # Final status
+        # Final status - safe to query now that reception has stopped
         if self.show_status:
+            # Small delay to let any pending data settle
+            time.sleep(0.1)
             status = self.device.get_status()
             if status:
                 print(f"[RX] Final Status: TEC:{status.tx_err_cnt} REC:{status.rx_err_cnt} LastErr:{status.last_error_str}")
+            else:
+                print(f"[RX] Final Status: Unable to query")
         print()
 
 
