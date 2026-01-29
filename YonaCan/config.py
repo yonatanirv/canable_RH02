@@ -25,6 +25,7 @@ WINDOW_MIN_WIDTH = 900
 WINDOW_MIN_HEIGHT = 600
 DATA_VIEWER_MAX_ROWS = 1000  # Max rows to display in real-time viewer
 DATA_VIEWER_UPDATE_MS = 50   # Update interval in milliseconds
+DEFAULT_GRAPH_UPDATE_RATE_MS = 150  # How often graphs redraw
 
 # Colors (Modern dark theme)
 COLORS = {

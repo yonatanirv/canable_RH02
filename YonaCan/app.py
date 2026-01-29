@@ -7,16 +7,18 @@ import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 import threading
 from datetime import datetime
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, Tuple
 import queue
 from collections import defaultdict, deque
+import time
 
 from config import (
     APP_NAME, APP_VERSION, COLORS, 
     SUPPORTED_BITRATES, DEFAULT_BITRATE,
     WINDOW_MIN_WIDTH, WINDOW_MIN_HEIGHT,
     DATA_VIEWER_MAX_ROWS, DATA_VIEWER_UPDATE_MS,
-    DEFAULT_LOG_MAX_SIZE_MB, DEFAULT_LOG_DIR
+    DEFAULT_LOG_MAX_SIZE_MB, DEFAULT_LOG_DIR,
+    DEFAULT_GRAPH_UPDATE_RATE_MS
 )
 from can_interface import CANInterface, CANFrame, CANDevice, FrameDirection
 from logger import CANLogger
@@ -62,11 +64,14 @@ class YonaCanApp:
         self._can_id_counts: Dict[int, int] = defaultdict(int)  # Frame count per ID
         self._selected_can_id: Optional[int] = None
         
-        # Byte history for line graphs (8 deques, one per byte)
-        self._byte_history: List[deque] = [deque(maxlen=1000) for _ in range(8)]
+        # Byte history for line graphs (8 deques storing (timestamp, value) tuples)
+        self._byte_history: List[deque[Tuple[float, int]]] = [deque(maxlen=1000) for _ in range(8)]
         self._graph_running = self.settings.get("graph_running", True)
         self._graph_samples = self.settings.get("graph_samples", 100)
         self._graph_zoom = self.settings.get("graph_zoom", 1.0)
+        self._graph_update_rate_ms = self.settings.get("graph_update_rate_ms", DEFAULT_GRAPH_UPDATE_RATE_MS)
+        self._last_graph_draw = 0.0
+        self._byte_active = [True] * 8
         
         # Setup UI
         self._setup_styles()
@@ -96,10 +101,16 @@ class YonaCanApp:
         self._graph_samples = self.settings.get("graph_samples", 100)
         self._graph_zoom = self.settings.get("graph_zoom", 1.0)
         self._graph_running = self.settings.get("graph_running", True)
+        try:
+            self._graph_update_rate_ms = int(self.settings.get("graph_update_rate_ms", DEFAULT_GRAPH_UPDATE_RATE_MS))
+        except (ValueError, TypeError):
+            self._graph_update_rate_ms = DEFAULT_GRAPH_UPDATE_RATE_MS
         
         # Update graph controls
         self.samples_var.set(str(self._graph_samples))
         self.zoom_var.set(f"{int(self._graph_zoom * 100)}%")
+        if hasattr(self, "rate_var"):
+            self.rate_var.set(str(self._graph_update_rate_ms))
         self._update_graph_button_state()
         
     def _save_settings(self):
@@ -119,6 +130,7 @@ class YonaCanApp:
         self.settings["graph_running"] = self._graph_running
         self.settings["graph_samples"] = self._graph_samples
         self.settings["graph_zoom"] = self._graph_zoom
+        self.settings["graph_update_rate_ms"] = self._graph_update_rate_ms
         
         # Window geometry
         self.settings["window_width"] = self.root.winfo_width()
@@ -418,24 +430,27 @@ class YonaCanApp:
         ttk.Label(right_frame, textvariable=self.selected_id_var, 
                  style="Title.TLabel").pack(anchor=tk.W)
         
+        # Use vertical paned window so user can resize bit/grid vs graphs
+        vertical_paned = ttk.PanedWindow(right_frame, orient=tk.VERTICAL)
+        vertical_paned.pack(fill=tk.BOTH, expand=True, pady=(10, 0))
+
         # === Bit-Level Visualization ===
-        bit_frame = ttk.LabelFrame(right_frame, text="Bit-Level View (8 bytes × 8 bits)", 
-                                   padding=10)
-        bit_frame.pack(fill=tk.X, pady=(10, 0))
+        bit_frame = ttk.LabelFrame(vertical_paned, text="Bit-Level View (8 bytes × 8 bits)", padding=10)
+        vertical_paned.add(bit_frame, weight=1)
         
         # Create 8x8 grid of bit indicators
         self.bit_canvas = tk.Canvas(bit_frame, 
                                     width=500, height=120,
                                     bg=COLORS["bg_dark"], 
                                     highlightthickness=0)
-        self.bit_canvas.pack(fill=tk.X)
+        self.bit_canvas.pack(fill=tk.BOTH, expand=True)
         
         # Draw initial bit grid
         self._draw_bit_grid()
         
         # === Byte-Level Line Graphs ===
-        graph_frame = ttk.LabelFrame(right_frame, text="Byte Values Over Time", padding=10)
-        graph_frame.pack(fill=tk.BOTH, expand=True, pady=(10, 0))
+        graph_frame = ttk.LabelFrame(vertical_paned, text="Byte Values Over Time", padding=10)
+        vertical_paned.add(graph_frame, weight=3)
         
         # Graph controls
         controls_frame = ttk.Frame(graph_frame, style="Medium.TFrame")
@@ -464,6 +479,15 @@ class YonaCanApp:
                                   state="readonly", width=6)
         zoom_combo.pack(side=tk.LEFT, padx=(0, 10))
         zoom_combo.bind('<<ComboboxSelected>>', self._on_zoom_change)
+
+        # Graph update rate
+        ttk.Label(controls_frame, text="Update (ms):", style="Medium.TLabel").pack(side=tk.LEFT, padx=(0, 5))
+        self.rate_var = tk.StringVar(value=str(self._graph_update_rate_ms))
+        rate_combo = ttk.Combobox(controls_frame, textvariable=self.rate_var,
+                                  values=["50", "75", "100", "150", "200", "300", "400", "500"],
+                                  state="readonly", width=6)
+        rate_combo.pack(side=tk.LEFT, padx=(0, 10))
+        rate_combo.bind('<<ComboboxSelected>>', self._on_graph_rate_change)
         
         # Clear graph button
         ttk.Button(controls_frame, text="🗑 Clear Graph", command=self._clear_byte_history,
@@ -475,9 +499,21 @@ class YonaCanApp:
         
         self._byte_colors = ["#e74c3c", "#e67e22", "#f39c12", "#2ecc71", 
                             "#1abc9c", "#3498db", "#9b59b6", "#95a5a6"]
+        self._byte_buttons: List[tk.Button] = []
+
         for i, color in enumerate(self._byte_colors):
-            tk.Label(legend_frame, text=f"B{i}", bg=color, fg="white",
-                    font=("Consolas", 8), padx=3).pack(side=tk.LEFT, padx=1)
+            btn = tk.Button(legend_frame,
+                           text=f"B{i}",
+                           bg=color,
+                           fg="white",
+                           font=("Consolas", 8, "bold"),
+                           width=3,
+                           relief=tk.SUNKEN,
+                           bd=2,
+                           command=lambda idx=i: self._toggle_byte_active(idx))
+            btn.pack(side=tk.LEFT, padx=1)
+            self._byte_buttons.append(btn)
+        self._update_byte_button_states()
         
         # Graph canvas
         self.byte_canvas = tk.Canvas(graph_frame,
@@ -492,7 +528,50 @@ class YonaCanApp:
         """Toggle graph running state."""
         self._graph_running = not self._graph_running
         self._update_graph_button_state()
+        if self._graph_running:
+            self._maybe_draw_graph(force=True)
     
+    def _toggle_byte_active(self, byte_idx: int):
+        """Toggle whether a byte's data is plotted."""
+        self._byte_active[byte_idx] = not self._byte_active[byte_idx]
+        self._update_byte_button_state(byte_idx)
+        self._maybe_draw_graph(force=True)
+
+    def _update_byte_button_states(self):
+        """Refresh the visual state for all byte selector buttons."""
+        for idx in range(len(self._byte_buttons)):
+            self._update_byte_button_state(idx)
+
+    def _update_byte_button_state(self, byte_idx: int):
+        """Update a single byte button's relief based on its state."""
+        btn = self._byte_buttons[byte_idx]
+        if self._byte_active[byte_idx]:
+            btn.configure(relief=tk.SUNKEN)
+        else:
+            btn.configure(relief=tk.RAISED)
+
+    def _on_graph_rate_change(self, event):
+        """Handle graph update rate changes from the UI."""
+        try:
+            rate = max(10, int(self.rate_var.get()))
+        except ValueError:
+            rate = DEFAULT_GRAPH_UPDATE_RATE_MS
+        self._graph_update_rate_ms = rate
+        self._maybe_draw_graph(force=True)
+
+    def _maybe_draw_graph(self, force: bool = False):
+        """Throttle graph redraws according to the configured rate."""
+        if not self._graph_running and not force:
+            return
+        now = time.time()
+        if force or (now - self._last_graph_draw) * 1000.0 >= self._graph_update_rate_ms:
+            self._draw_line_graph()
+            self._last_graph_draw = now
+
+    def _format_time_label(self, timestamp: float) -> str:
+        """Format a timestamp label for the time axis."""
+        return f"{timestamp:.2f}s"
+
     def _update_graph_button_state(self):
         """Update the start/stop button text."""
         if self._graph_running:
@@ -506,6 +585,7 @@ class YonaCanApp:
             self._graph_samples = int(self.samples_var.get())
         except ValueError:
             self._graph_samples = 100
+        self._maybe_draw_graph(force=True)
     
     def _on_zoom_change(self, event):
         """Handle zoom selection change."""
@@ -514,13 +594,13 @@ class YonaCanApp:
             self._graph_zoom = int(zoom_str) / 100.0
         except ValueError:
             self._graph_zoom = 1.0
-        self._draw_line_graph()
+        self._maybe_draw_graph(force=True)
     
     def _clear_byte_history(self):
         """Clear byte history for graphs."""
         for hist in self._byte_history:
             hist.clear()
-        self._draw_line_graph()
+        self._maybe_draw_graph(force=True)
         
     def _draw_bit_grid(self, data: bytes = None):
         """Draw the bit-level visualization grid."""
@@ -590,7 +670,7 @@ class YonaCanApp:
     
     def _on_byte_canvas_resize(self, event):
         """Handle byte canvas resize."""
-        self._draw_line_graph()
+        self._maybe_draw_graph(force=True)
     
     def _draw_line_graph(self):
         """Draw byte-level line graphs."""
@@ -612,7 +692,7 @@ class YonaCanApp:
         graph_height = height - margin_top - margin_bottom
         
         # Apply zoom
-        effective_samples = int(self._graph_samples / self._graph_zoom)
+        effective_samples = max(1, int(self._graph_samples / self._graph_zoom))
         
         # Draw background grid
         self._draw_graph_grid(margin_left, margin_top, graph_width, graph_height)
@@ -628,28 +708,58 @@ class YonaCanApp:
                                     text="0", fill=COLORS["fg_secondary"],
                                     font=("Consolas", 8), anchor=tk.E)
         
-        # Draw each byte's line
+        active_histories = []
+        min_time = float("inf")
+        max_time = 0.0
+        
         for byte_idx in range(8):
+            if not self._byte_active[byte_idx]:
+                continue
             history = list(self._byte_history[byte_idx])
             if len(history) < 2:
                 continue
             
             # Get last N samples based on effective samples
             history = history[-effective_samples:]
+            if not history:
+                continue
             
-            # Build points
+            active_histories.append((byte_idx, history))
+            min_time = min(min_time, history[0][0])
+            max_time = max(max_time, history[-1][0])
+        
+        if min_time == float("inf"):
+            min_time = 0.0
+            max_time = 1.0
+        elif max_time <= min_time:
+            max_time = min_time + 0.001
+        
+        time_span = max(0.001, max_time - min_time)
+        
+        # Draw each byte's line
+        for byte_idx, history in active_histories:
             points = []
-            for i, value in enumerate(history):
-                x = margin_left + (i / max(1, len(history) - 1)) * graph_width
+            for timestamp, value in history:
+                x = margin_left + ((timestamp - min_time) / time_span) * graph_width
                 y = margin_top + graph_height - (value / 255.0) * graph_height
                 points.extend([x, y])
             
-            # Draw line
             if len(points) >= 4:
                 self.byte_canvas.create_line(points, 
                                             fill=self._byte_colors[byte_idx],
                                             width=2,
                                             smooth=True)
+        
+        # Draw time axis labels
+        label_y = margin_top + graph_height + 12
+        self.byte_canvas.create_text(margin_left, label_y,
+                                     text=self._format_time_label(min_time),
+                                     fill=COLORS["fg_secondary"],
+                                     font=("Consolas", 8), anchor=tk.NW)
+        self.byte_canvas.create_text(margin_left + graph_width, label_y,
+                                     text=self._format_time_label(max_time),
+                                     fill=COLORS["fg_secondary"],
+                                     font=("Consolas", 8), anchor=tk.NE)
     
     def _draw_graph_grid(self, x, y, width, height):
         """Draw background grid for the graph."""
@@ -692,6 +802,7 @@ class YonaCanApp:
             if can_id in self._can_id_data:
                 frame = self._can_id_data[can_id]
                 self._draw_bit_grid(frame.data)
+                self._maybe_draw_graph(force=True)
         except ValueError:
             pass
     
@@ -816,7 +927,7 @@ class YonaCanApp:
                 # Update byte history for selected ID
                 if self._graph_running and frame.can_id == self._selected_can_id:
                     for i in range(min(8, len(frame.data))):
-                        self._byte_history[i].append(frame.data[i])
+                        self._byte_history[i].append((frame.timestamp, frame.data[i]))
                     
             except queue.Empty:
                 break
@@ -858,8 +969,7 @@ class YonaCanApp:
         if self._selected_can_id is not None and self._selected_can_id in self._can_id_data:
             frame = self._can_id_data[self._selected_can_id]
             self._draw_bit_grid(frame.data)
-            if self._graph_running:
-                self._draw_line_graph()
+            self._maybe_draw_graph()
         
         # Update log status
         if self.logger.is_logging:
