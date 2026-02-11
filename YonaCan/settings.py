@@ -27,6 +27,14 @@ DEFAULT_SETTINGS = {
     # Data Viewer
     "auto_scroll": True,
     
+    # DBC files
+    "last_dbc_path": "",
+    "last_pv_dbc_path": "",
+    
+    # Simulator
+    "sim_selected_spns": [],
+    "sim_spn_configs": {},
+    
     # Raw Data Analyzer
     "graph_running": True,
     "graph_samples": 100,

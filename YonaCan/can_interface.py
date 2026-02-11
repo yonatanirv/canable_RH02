@@ -76,10 +76,13 @@ class CANDevice:
     name: str
     device_id: str
     channel: int
+    serial: str = ""
     device_obj: any = None
     
     def __str__(self):
-        return f"{self.name} (Ch:{self.channel})"
+        if self.serial:
+            return f"{self.name} [SN: {self.serial}]"
+        return f"{self.name} [{self.device_id}]"
 
 
 class CANInterface:
@@ -87,15 +90,20 @@ class CANInterface:
     CAN Interface for candleLight/gs_usb devices.
     """
     
+    # Number of consecutive RX errors before declaring device disconnected
+    _MAX_CONSECUTIVE_ERRORS = 10
+
     def __init__(self):
         self._device: Optional[any] = None
         self._running = False
         self._rx_thread: Optional[threading.Thread] = None
         self._rx_queue: queue.Queue = queue.Queue()
         self._frame_callback: Optional[Callable[[CANFrame], None]] = None
+        self._disconnect_callback: Optional[Callable[[str], None]] = None
         self._start_time: float = 0
         self._frame_count: int = 0
         self._bitrate: int = 500000
+        self._connected_device: Optional[CANDevice] = None
         
     @staticmethod
     def scan_devices() -> List[CANDevice]:
@@ -107,10 +115,26 @@ class CANInterface:
             gs_devices = GsUsb.scan()
             
             for i, dev in enumerate(gs_devices):
+                # Get USB product name (genuine HW identity)
+                try:
+                    product = dev.gs_usb.product or "candleLight"
+                except Exception:
+                    product = "candleLight"
+                
+                # Get serial number (persistent, unique per device)
+                try:
+                    serial = dev.serial_number or ""
+                except Exception:
+                    serial = ""
+                
+                # Fallback device_id if no serial
+                device_id = serial if serial else f"usb_{dev.bus}:{dev.address}"
+                
                 devices.append(CANDevice(
-                    name=str(dev),
-                    device_id=f"gs_usb_{i}",
+                    name=product,
+                    device_id=device_id,
                     channel=i,
+                    serial=serial,
                     device_obj=dev
                 ))
         except Exception as e:
@@ -123,6 +147,7 @@ class CANInterface:
         try:
             self._device = device.device_obj
             self._bitrate = bitrate
+            self._connected_device = device
             
             if not self._device.set_bitrate(bitrate):
                 raise Exception("Failed to set bitrate")
@@ -141,6 +166,7 @@ class CANInterface:
         except Exception as e:
             print(f"Connection error: {e}")
             self._device = None
+            self._connected_device = None
             return False
     
     def disconnect(self):
@@ -157,6 +183,7 @@ class CANInterface:
             except Exception:
                 pass
             self._device = None
+        self._connected_device = None
     
     def send(self, can_id: int, data: bytes, extended: bool = False) -> bool:
         """Send a CAN frame."""
@@ -198,16 +225,32 @@ class CANInterface:
         """Set callback for received frames."""
         self._frame_callback = callback
     
+    def set_disconnect_callback(self, callback: Callable[[str], None]):
+        """Set callback for unexpected device disconnection."""
+        self._disconnect_callback = callback
+    
+    # echo_id value for frames received from other nodes on the bus
+    _GS_USB_ECHO_ID_RX = 0xFFFFFFFF
+
     def _rx_loop(self):
         """Receive loop running in background thread."""
         from gs_usb.gs_usb_frame import GsUsbFrame
         from gs_usb.constants import CAN_EFF_FLAG, CAN_RTR_FLAG, CAN_ERR_FLAG
+        
+        consecutive_errors = 0
         
         while self._running:
             try:
                 # Non-blocking read with timeout
                 frame = GsUsbFrame()
                 if self._device.read(frame, timeout_ms=100):
+                    consecutive_errors = 0  # Reset on any successful read
+                    
+                    # Skip echo frames (our own TX bounced back by HW).
+                    # Real RX from other nodes has echo_id == 0xFFFFFFFF.
+                    if frame.echo_id != self._GS_USB_ECHO_ID_RX:
+                        continue
+                    
                     # Parse frame
                     is_extended = bool(frame.can_id & CAN_EFF_FLAG)
                     is_remote = bool(frame.can_id & CAN_RTR_FLAG)
@@ -229,15 +272,35 @@ class CANInterface:
                     
                     if self._frame_callback:
                         self._frame_callback(rx_frame)
+                else:
+                    # read() returned False = timeout, not an error
+                    consecutive_errors = 0
                         
             except Exception as e:
                 if self._running:
-                    print(f"RX error: {e}")
+                    consecutive_errors += 1
+                    print(f"RX error ({consecutive_errors}): {e}")
+                    
+                    if consecutive_errors >= self._MAX_CONSECUTIVE_ERRORS:
+                        # Device is likely physically disconnected
+                        self._running = False
+                        self._device = None
+                        self._connected_device = None
+                        if self._disconnect_callback:
+                            self._disconnect_callback(
+                                "Device disconnected (communication lost)")
+                        break
+                    
                     time.sleep(0.1)
     
     @property
     def is_connected(self) -> bool:
         return self._device is not None and self._running
+    
+    @property
+    def connected_device(self) -> Optional[CANDevice]:
+        """Return the currently connected CANDevice, or None."""
+        return self._connected_device if self.is_connected else None
     
     @property
     def frame_count(self) -> int:
