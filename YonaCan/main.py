@@ -13,8 +13,10 @@ Or run as module:
 import sys
 import os
 
-# Add parent directory to path for imports
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+# Add script directory to path for imports (dev mode)
+# In frozen exe, PyInstaller handles module paths automatically
+if not getattr(sys, 'frozen', False):
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from app import main
 

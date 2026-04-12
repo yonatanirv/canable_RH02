@@ -14,20 +14,36 @@ from enum import Enum
 
 # Setup libusb for Windows
 def setup_libusb():
-    """Setup libusb DLL path for Windows."""
+    """Setup libusb DLL path for Windows (works for both dev and frozen exe)."""
+    import sys
+
+    def _add_dll_dir(dll_dir):
+        os.environ['PATH'] = dll_dir + os.pathsep + os.environ.get('PATH', '')
+        if hasattr(os, 'add_dll_directory'):
+            try:
+                os.add_dll_directory(dll_dir)
+            except OSError:
+                pass
+
+    # 1) Frozen exe: look next to the executable
+    if getattr(sys, 'frozen', False):
+        exe_dir = os.path.dirname(sys.executable)
+        dll_path = os.path.join(exe_dir, 'libusb-1.0.dll')
+        if os.path.exists(dll_path):
+            _add_dll_dir(exe_dir)
+            return True
+
+    # 2) Dev mode: look inside the pip-installed libusb package
     try:
         import libusb
         pkg_path = libusb.__path__[0]
         dll_path = os.path.join(pkg_path, '_platform', 'windows', 'x86_64', 'libusb-1.0.dll')
-        
         if os.path.exists(dll_path):
-            dll_dir = os.path.dirname(dll_path)
-            os.environ['PATH'] = dll_dir + os.pathsep + os.environ.get('PATH', '')
-            if hasattr(os, 'add_dll_directory'):
-                os.add_dll_directory(dll_dir)
+            _add_dll_dir(os.path.dirname(dll_path))
             return True
     except Exception:
         pass
+
     return False
 
 
