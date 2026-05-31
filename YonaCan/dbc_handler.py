@@ -315,6 +315,43 @@ class DBCHandler:
         """Check if a DBC file is loaded."""
         return self.db is not None and len(self.pgns) > 0
 
+    def get_spn_number(self, frame_id: int, signal_name: str) -> Optional[int]:
+        """Read J1939 SPN number from DBC attribute for a signal."""
+        if not self.db:
+            return None
+        try:
+            msg = self.db.get_message_by_frame_id(frame_id)
+            sig = msg.get_signal_by_name(signal_name)
+        except Exception:
+            return None
+        attrs = getattr(sig, "dbc", None)
+        if attrs is None:
+            return None
+        spn_attr = attrs.attributes.get("SPN")
+        if spn_attr is None:
+            return None
+        try:
+            return int(spn_attr.value)
+        except (TypeError, ValueError):
+            return None
+
+    def get_message_for_pgn(self, pgn: int, can_id: Optional[int] = None):
+        """Find cantools message for a PGN (optionally prefer exact CAN ID)."""
+        if not self.db:
+            return None
+        if can_id is not None:
+            try:
+                return self.db.get_message_by_frame_id(can_id)
+            except Exception:
+                pass
+        for msg in self.db.messages:
+            is_ext = getattr(msg, "is_extended_frame", False)
+            if is_ext and extract_j1939_pgn(msg.frame_id) == pgn:
+                return msg
+            if not is_ext and msg.frame_id == pgn:
+                return msg
+        return None
+
     def get_selected_spn_info(self, selected_keys: set) -> List[Tuple[PGNInfo, SPNInfo]]:
         """
         Get full info for selected SPNs.

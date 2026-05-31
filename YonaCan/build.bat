@@ -102,6 +102,13 @@ if exist "DBCs" (
     echo       DBC files copied to dist.
 )
 
+REM -- Copy ISOBUS DDI dictionary if present --
+if exist "ISOBUS" (
+    if not exist "dist\YonaCan\ISOBUS" mkdir "dist\YonaCan\ISOBUS"
+    xcopy "ISOBUS\*.*" "dist\YonaCan\ISOBUS\" /Y /Q >nul 2>&1
+    echo       ISOBUS dictionary copied to dist.
+)
+
 REM -- Copy README --
 if exist "README.txt" (
     copy "README.txt" "dist\YonaCan\README.txt" /Y >nul 2>&1

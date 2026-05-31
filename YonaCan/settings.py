@@ -30,6 +30,19 @@ DEFAULT_SETTINGS = {
     # DBC files
     "last_dbc_path": "",
     "last_pv_dbc_path": "",
+
+    # Log Import Viewer
+    "last_log_import_path": "",
+    "last_log_import_file_type": "cl2000",
+    "last_log_import_dbc_path": "",
+    "last_isobus_ddi_path": "",
+    "last_log_import_viz_mode": "bytes",
+    "log_import_max_plot_points": 2500,
+
+    # ISO BUS raw-data viewer
+    "isobus_raw_pgn": 61184,
+    "isobus_raw_id_indices": [0],
+    "graph_plot_mode": "line",
     
     # Simulator
     "sim_selected_spns": [],

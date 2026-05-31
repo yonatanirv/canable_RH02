@@ -8,7 +8,7 @@ import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 import threading
 from datetime import datetime
-from typing import Optional, List, Dict, Tuple, Set
+from typing import Optional, List, Dict, Tuple, Set, Callable
 import queue
 from collections import defaultdict, deque
 import time
@@ -25,6 +25,24 @@ from can_interface import CANInterface, CANFrame, CANDevice, FrameDirection
 from logger import CANLogger
 from settings import SettingsManager
 from dbc_handler import DBCHandler, DBCConfig, PGNInfo, SPNInfo, extract_j1939_pgn
+from log_import_parser import (
+    LogFileType, LogSessionInfo, PgnSummary, scan_log, iter_frames_for_pgn,
+)
+from isobus_dictionary import IsobusDictionary, default_dictionary_path
+from log_graph_view import LogGraphView, TimeSeries, attach_graph_toolbar
+from isobus_raw_parser import (
+    DEFAULT_RAW_DATA_PGN,
+    IsobusTypeSummary,
+    MessageKey,
+    build_type_history_cache,
+    format_id_indices_label,
+    format_message_key,
+    normalize_id_indices,
+    parse_pgn_value,
+    payload_byte_indices,
+    scan_isobus_raw_log,
+    validate_id_byte_indices,
+)
 
 
 class YonaCanApp:
@@ -44,11 +62,15 @@ class YonaCanApp:
         self.root.minsize(WINDOW_MIN_WIDTH, WINDOW_MIN_HEIGHT)
         self.root.configure(bg=COLORS["bg_dark"])
         
-        # Restore window position if saved
+        # Restore window position if saved (clamped to visible area after UI builds)
+        self._pending_window_pos: Optional[Tuple[int, int]] = None
         win_x = self.settings.get("window_x")
         win_y = self.settings.get("window_y")
         if win_x is not None and win_y is not None:
-            self.root.geometry(f"+{win_x}+{win_y}")
+            try:
+                self._pending_window_pos = (int(win_x), int(win_y))
+            except (TypeError, ValueError):
+                self._pending_window_pos = None
         
         # Initialize components
         self.can_interface = CANInterface()
@@ -97,6 +119,47 @@ class YonaCanApp:
         self._pv_graph_colors = ["#e74c3c", "#3498db", "#2ecc71", "#f39c12", "#9b59b6"]
         # RX-driven PGN tracking: pgn_number -> info dict
         self._pv_rx_pgns: Dict[int, Dict] = {}
+
+        # Log Import Viewer state
+        self._li_log_path: str = ""
+        self._li_file_type = LogFileType.CL2000
+        self._li_pgn_index: Dict[int, PgnSummary] = {}
+        self._li_dbc = DBCHandler()
+        self._li_isobus = IsobusDictionary()
+        self._li_selected_pgn: Optional[int] = None
+        self._li_scan_cancel = False
+        self._li_scan_thread: Optional[threading.Thread] = None
+        self._li_session = LogSessionInfo()
+        self._li_pgn_cache: Dict[int, Dict] = {}
+        self._li_byte_graph: Optional[LogGraphView] = None
+        self._li_graph_slots: List[Dict] = []
+        self._li_selected_graph_spns: List[str] = []
+        self._li_pgn_list_data: List[Tuple[int, str]] = []
+        self._li_max_points_var = tk.StringVar(value="2500")
+        self._li_popout_window: Optional[tk.Toplevel] = None
+        self._li_graph_colors = ["#e74c3c", "#3498db", "#2ecc71", "#f39c12", "#9b59b6"]
+
+        # ISO BUS raw-data viewer state
+        self._ib_log_path: str = ""
+        self._ib_file_type = LogFileType.CL2000
+        self._ib_type_index: Dict[MessageKey, IsobusTypeSummary] = {}
+        self._ib_session = LogSessionInfo()
+        self._ib_type_cache: Dict[MessageKey, Dict] = {}
+        self._ib_selected_type: Optional[MessageKey] = None
+        self._ib_id_indices: Tuple[int, ...] = (0,)
+        self._ib_id_byte_vars: List[tk.BooleanVar] = []
+        self._ib_type_list_data: List[Tuple[int, str]] = []
+        self._ib_scan_cancel = False
+        self._ib_scan_thread: Optional[threading.Thread] = None
+        self._ib_byte_graph: Optional[LogGraphView] = None
+        self._ib_byte_btns: List[tk.Button] = []
+        self._ib_byte_active: List[bool] = [True] * 8
+        self._ib_popout_window: Optional[tk.Toplevel] = None
+        self._ib_max_points_var = tk.StringVar(value="2500")
+        self._graph_plot_mode = self.settings.get("graph_plot_mode", "line")
+        self._graph_plot_mode_btn = tk.StringVar(
+            value="Scatter" if self._graph_plot_mode == "scatter" else "Line")
+        self._graph_views: List[LogGraphView] = []
         
         # Byte history for line graphs (8 deques storing (timestamp, value) tuples)
         self._byte_history: List[deque[Tuple[float, int]]] = [deque(maxlen=1000) for _ in range(8)]
@@ -114,9 +177,53 @@ class YonaCanApp:
         
         # Apply saved settings to UI
         self._apply_settings()
+
+        self._ensure_window_on_screen()
         
         # Start UI update loop
         self._schedule_update()
+
+    def _ensure_window_on_screen(self):
+        """Place the main window fully on a visible monitor (handles bad saved coords)."""
+        self.root.update_idletasks()
+
+        width = max(self.root.winfo_width(), WINDOW_MIN_WIDTH)
+        height = max(self.root.winfo_height(), WINDOW_MIN_HEIGHT)
+
+        if self._pending_window_pos is not None:
+            x, y = self._pending_window_pos
+        else:
+            x, y = self.root.winfo_x(), self.root.winfo_y()
+
+        # Virtual desktop spans all monitors (may have negative origin)
+        try:
+            vx = self.root.winfo_vrootx()
+            vy = self.root.winfo_vrooty()
+            vw = self.root.winfo_vrootwidth()
+            vh = self.root.winfo_vrootheight()
+        except tk.TclError:
+            vx, vy = 0, 0
+            vw = self.root.winfo_screenwidth()
+            vh = self.root.winfo_screenheight()
+
+        visible = 80  # title bar / corner must remain reachable
+        min_x = vx - width + visible
+        max_x = vx + vw - visible
+        min_y = vy
+        max_y = vy + vh - visible
+
+        if min_x > max_x:
+            x = vx + max(0, (vw - width) // 2)
+        else:
+            x = max(min_x, min(x, max_x))
+
+        if min_y > max_y:
+            y = vy + max(0, (vh - height) // 2)
+        else:
+            y = max(min_y, min(y, max_y))
+
+        self.root.geometry(f"{width}x{height}+{int(x)}+{int(y)}")
+        self._pending_window_pos = None
         
     def _apply_settings(self):
         """Apply saved settings to UI elements."""
@@ -172,6 +279,10 @@ class YonaCanApp:
                 self._update_signal_gen_table()
             except Exception as e:
                 print(f"Could not restore DBC: {e}")
+
+        # Log Import Viewer: default dictionaries
+        self.root.after(100, self._li_restore_defaults)
+        self.root.after(150, self._ib_restore_defaults)
         
     def _save_settings(self):
         """Save current settings from UI."""
@@ -311,7 +422,17 @@ class YonaCanApp:
         self.notebook.add(self.tab_parsed, text="📈 Parsed Data Viewer")
         self._create_parsed_viewer_tab(self.tab_parsed)
         
-        # Tab 4: CAN Simulator
+        # Tab 4: Log Import Viewer
+        self.tab_log_import = ttk.Frame(self.notebook, style="Dark.TFrame")
+        self.notebook.add(self.tab_log_import, text="📁 Log Import Viewer")
+        self._create_log_import_tab(self.tab_log_import)
+
+        # Tab 5: ISO BUS raw data
+        self.tab_isobus = ttk.Frame(self.notebook, style="Dark.TFrame")
+        self.notebook.add(self.tab_isobus, text="🌾 ISO BUS Raw")
+        self._create_isobus_tab(self.tab_isobus)
+
+        # Tab 6: CAN Simulator
         self.tab_simulator = ttk.Frame(self.notebook, style="Dark.TFrame")
         self.notebook.add(self.tab_simulator, text="🔧 CAN Simulator")
         self._create_simulator_tab(self.tab_simulator)
@@ -1578,6 +1699,1281 @@ class YonaCanApp:
             slot["value_var"].set(f"{history[-1][1]:.4g}")
 
     # ========================================================================
+    # Log Import Viewer Tab
+    # ========================================================================
+
+    def _create_log_import_tab(self, parent):
+        """Create the Log Import Viewer tab for CL2000 / CSV logs."""
+        toolbar = ttk.Frame(parent, style="Medium.TFrame", padding=6)
+        toolbar.pack(fill=tk.X, padx=5, pady=5)
+
+        row1 = ttk.Frame(toolbar, style="Medium.TFrame")
+        row1.pack(fill=tk.X, pady=(0, 4))
+
+        ttk.Label(row1, text="Log:", style="Medium.TLabel").pack(side=tk.LEFT)
+        self._li_log_path_var = tk.StringVar(value="No log loaded")
+        ttk.Entry(row1, textvariable=self._li_log_path_var, width=45,
+                  state="readonly").pack(side=tk.LEFT, fill=tk.X, expand=True, padx=4)
+        ttk.Button(row1, text="Browse", command=self._li_browse_log,
+                   style="Accent.TButton", width=8).pack(side=tk.LEFT, padx=2)
+
+        self._li_file_type_var = tk.StringVar(value="CSS CL2000 (.txt)")
+        ft_combo = ttk.Combobox(
+            row1, textvariable=self._li_file_type_var, width=18, state="readonly",
+            values=["CSS CL2000 (.txt)", "YonaCan CSV (.csv)"])
+        ft_combo.pack(side=tk.LEFT, padx=4)
+
+        ttk.Button(row1, text="Load", command=self._li_start_load,
+                   style="Accent.TButton", width=8).pack(side=tk.LEFT, padx=2)
+
+        row2 = ttk.Frame(toolbar, style="Medium.TFrame")
+        row2.pack(fill=tk.X, pady=(0, 4))
+
+        ttk.Label(row2, text="DBC:", style="Medium.TLabel").pack(side=tk.LEFT)
+        self._li_dbc_path_var = tk.StringVar(value="No DBC loaded")
+        ttk.Entry(row2, textvariable=self._li_dbc_path_var, width=40,
+                  state="readonly").pack(side=tk.LEFT, fill=tk.X, expand=True, padx=4)
+        ttk.Button(row2, text="Browse", command=self._li_browse_dbc,
+                   style="Small.TButton", width=8).pack(side=tk.LEFT, padx=2)
+
+        ttk.Label(row2, text="ISOBUS:", style="Medium.TLabel").pack(side=tk.LEFT, padx=(8, 0))
+        self._li_isobus_path_var = tk.StringVar(value="No dictionary")
+        ttk.Entry(row2, textvariable=self._li_isobus_path_var, width=35,
+                  state="readonly").pack(side=tk.LEFT, fill=tk.X, expand=True, padx=4)
+        ttk.Button(row2, text="Browse", command=self._li_browse_isobus,
+                   style="Small.TButton", width=8).pack(side=tk.LEFT, padx=2)
+
+        self._li_status_var = tk.StringVar(value="Select a log file and click Load")
+        ttk.Label(toolbar, textvariable=self._li_status_var,
+                  style="Status.TLabel", wraplength=900).pack(fill=tk.X, pady=(4, 0))
+
+        self._li_progress = ttk.Progressbar(toolbar, mode="indeterminate")
+        self._li_progress.pack(fill=tk.X, pady=(4, 0))
+
+        paned = ttk.PanedWindow(parent, orient=tk.HORIZONTAL)
+        paned.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+
+        # Left: PGN list
+        left = ttk.Frame(paned, style="Medium.TFrame", padding=8)
+        paned.add(left, weight=1)
+        ttk.Label(left, text="PGNs in log", style="Title.TLabel").pack(anchor=tk.W)
+        filt_row = ttk.Frame(left, style="Medium.TFrame")
+        filt_row.pack(fill=tk.X, pady=4)
+        ttk.Label(filt_row, text="Filter:", style="Medium.TLabel").pack(side=tk.LEFT)
+        self._li_pgn_filter_var = tk.StringVar()
+        self._li_pgn_filter_var.trace_add("write", lambda *_: self._li_refresh_pgn_list())
+        ttk.Entry(filt_row, textvariable=self._li_pgn_filter_var, width=20).pack(
+            side=tk.LEFT, fill=tk.X, expand=True, padx=4)
+        lf = ttk.Frame(left)
+        lf.pack(fill=tk.BOTH, expand=True)
+        self._li_pgn_listbox = tk.Listbox(
+            lf, bg=COLORS["bg_dark"], fg=COLORS["fg_primary"],
+            selectbackground=COLORS["accent"], font=("Consolas", 10), activestyle="none")
+        self._li_pgn_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self._li_pgn_listbox.bind("<<ListboxSelect>>", self._li_on_pgn_select)
+        sb = ttk.Scrollbar(lf, orient=tk.VERTICAL, command=self._li_pgn_listbox.yview)
+        self._li_pgn_listbox.configure(yscrollcommand=sb.set)
+        sb.pack(side=tk.RIGHT, fill=tk.Y)
+
+        # Center: SPN table
+        center = ttk.Frame(paned, style="Medium.TFrame", padding=8)
+        paned.add(center, weight=2)
+        ttk.Label(center, text="SPN content (last frame)", style="Title.TLabel").pack(anchor=tk.W)
+        tf = ttk.Frame(center)
+        tf.pack(fill=tk.BOTH, expand=True, pady=4)
+        cols = ("name", "spn", "value", "unit")
+        self._li_spn_tree = ttk.Treeview(tf, columns=cols, show="headings", height=12)
+        for c, t, w in zip(cols, ("Signal", "SPN#", "Value", "Unit"),
+                           (180, 60, 90, 60)):
+            self._li_spn_tree.heading(c, text=t)
+            self._li_spn_tree.column(c, width=w, anchor=tk.W if c == "name" else tk.CENTER)
+        self._li_spn_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self._li_spn_tree.bind("<ButtonRelease-1>", self._li_on_spn_click)
+        tsb = ttk.Scrollbar(tf, orient=tk.VERTICAL, command=self._li_spn_tree.yview)
+        self._li_spn_tree.configure(yscrollcommand=tsb.set)
+        tsb.pack(side=tk.RIGHT, fill=tk.Y)
+
+        # Right: presentation
+        right = ttk.LabelFrame(paned, text="Presentation", padding=8)
+        paned.add(right, weight=3)
+        ctrl = ttk.Frame(right, style="Medium.TFrame")
+        ctrl.pack(fill=tk.X)
+        ttk.Label(ctrl, text="Mode:", style="Medium.TLabel").pack(side=tk.LEFT)
+        self._li_viz_mode_var = tk.StringVar(value="bytes")
+        vm = ttk.Combobox(ctrl, textvariable=self._li_viz_mode_var, width=14,
+                          state="readonly", values=["bytes", "spns", "ddi"])
+        vm.pack(side=tk.LEFT, padx=4)
+        vm.bind("<<ComboboxSelected>>", lambda e: self._li_on_viz_mode_change())
+
+        self._li_viz_container = ttk.Frame(right, style="Dark.TFrame")
+        self._li_viz_container.pack(fill=tk.BOTH, expand=True, pady=(8, 0))
+
+        self._li_bytes_frame = ttk.Frame(self._li_viz_container, style="Dark.TFrame")
+        self._li_spns_frame = ttk.Frame(self._li_viz_container, style="Dark.TFrame")
+        self._li_ddi_frame = ttk.Frame(self._li_viz_container, style="Dark.TFrame")
+
+        self._li_byte_graph = LogGraphView(
+            tk.Canvas(self._li_bytes_frame, bg=COLORS["bg_dark"], highlightthickness=0),
+            max_draw_points=2500,
+            y_fixed_0_255=True,
+            hover_enabled=True,
+            value_as_int=True,
+        )
+        self._li_byte_canvas = self._li_byte_graph.canvas
+        self._register_graph_view(self._li_byte_graph)
+        attach_graph_toolbar(
+            self._li_bytes_frame, self._li_byte_graph,
+            on_popout=lambda: self._li_popout_graph(self._li_byte_graph, "Log bytes"),
+            max_points_var=self._li_max_points_var,
+            on_y_0_255=self._li_toggle_byte_y_scale,
+            on_plot_mode_toggle=self._toggle_graph_plot_mode,
+            plot_mode_label=self._graph_plot_mode_btn,
+        )
+        self._li_byte_canvas.pack(fill=tk.BOTH, expand=True)
+        bl = ttk.Frame(self._li_bytes_frame)
+        bl.pack(fill=tk.X, pady=4)
+        self._li_byte_btns: List[tk.Button] = []
+        for i, color in enumerate(self._byte_colors):
+            btn = tk.Button(bl, text=f"B{i}", bg=color, fg="white", width=3,
+                            command=lambda idx=i: self._li_toggle_byte(idx))
+            btn.pack(side=tk.LEFT, padx=1)
+            self._li_byte_btns.append(btn)
+
+        self._li_spn_graph_host = ttk.Frame(self._li_spns_frame, style="Dark.TFrame")
+        self._li_spn_graph_host.pack(fill=tk.BOTH, expand=True)
+        ttk.Label(self._li_spn_graph_host,
+                  text="Click SPN rows in the center table to graph (max 5)",
+                  style="Status.TLabel").pack(pady=20)
+
+        ddi_tf = ttk.Frame(self._li_ddi_frame)
+        ddi_tf.pack(fill=tk.BOTH, expand=True)
+        ddi_cols = ("ddi", "name", "unit")
+        self._li_ddi_tree = ttk.Treeview(ddi_tf, columns=ddi_cols, show="headings", height=8)
+        self._li_ddi_tree.heading("ddi", text="DDI")
+        self._li_ddi_tree.heading("name", text="Name")
+        self._li_ddi_tree.heading("unit", text="Unit")
+        self._li_ddi_tree.column("ddi", width=50, anchor=tk.CENTER)
+        self._li_ddi_tree.column("name", width=200)
+        self._li_ddi_tree.column("unit", width=80)
+        self._li_ddi_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self._li_ddi_tree.bind("<<TreeviewSelect>>", self._li_on_ddi_select)
+        dsb = ttk.Scrollbar(ddi_tf, orient=tk.VERTICAL, command=self._li_ddi_tree.yview)
+        self._li_ddi_tree.configure(yscrollcommand=dsb.set)
+        dsb.pack(side=tk.RIGHT, fill=tk.Y)
+        drow = ttk.Frame(self._li_ddi_frame)
+        drow.pack(fill=tk.X, pady=4)
+        ttk.Label(drow, text="Search DDI:", style="Medium.TLabel").pack(side=tk.LEFT)
+        self._li_ddi_search_var = tk.StringVar()
+        self._li_ddi_search_var.trace_add("write", lambda *_: self._li_populate_ddi_tree())
+        ttk.Entry(drow, textvariable=self._li_ddi_search_var, width=20).pack(
+            side=tk.LEFT, padx=4)
+        self._li_ddi_detail = tk.Text(
+            self._li_ddi_frame, height=8, bg=COLORS["bg_dark"], fg=COLORS["fg_primary"],
+            font=("Segoe UI", 9), wrap=tk.WORD, state=tk.DISABLED)
+        self._li_ddi_detail.pack(fill=tk.BOTH, expand=True, pady=4)
+
+        self._li_bytes_frame.pack(fill=tk.BOTH, expand=True)
+
+    def _li_restore_defaults(self):
+        """Load saved or bundled dictionary paths for log import tab."""
+        dbc = self.settings.get("last_log_import_dbc_path", "")
+        if not dbc or not os.path.isfile(dbc):
+            dbc = os.path.join(os.path.dirname(os.path.abspath(__file__)), "DBCs", "j1939.dbc")
+        if os.path.isfile(dbc):
+            try:
+                self._li_load_dbc_file(dbc, show_message=False)
+            except Exception as e:
+                print(f"Log import DBC restore: {e}")
+
+        iso = self.settings.get("last_isobus_ddi_path", "")
+        if not iso or not os.path.isfile(iso):
+            iso = default_dictionary_path()
+        if os.path.isfile(iso):
+            try:
+                self._li_load_isobus_file(iso, show_message=False)
+            except Exception as e:
+                print(f"Log import ISOBUS restore: {e}")
+
+        log_path = self.settings.get("last_log_import_path", "")
+        ft = self.settings.get("last_log_import_file_type", "cl2000")
+        self._li_file_type_var.set(
+            "YonaCan CSV (.csv)" if ft == "yonacan_csv" else "CSS CL2000 (.txt)")
+        viz = self.settings.get("last_log_import_viz_mode", "bytes")
+        if viz in ("bytes", "spns", "ddi"):
+            self._li_viz_mode_var.set(viz)
+            self._li_on_viz_mode_change()
+
+        pts = self.settings.get("log_import_max_plot_points", 2500)
+        self._li_max_points_var.set(str(pts))
+
+        if log_path and os.path.isfile(log_path):
+            self._li_log_path = log_path
+            self._li_log_path_var.set(log_path)
+            self._li_start_load(show_message=False)
+
+    def _li_file_type_from_ui(self) -> LogFileType:
+        if "csv" in self._li_file_type_var.get().lower():
+            return LogFileType.YONACAN_CSV
+        return LogFileType.CL2000
+
+    def _li_compute_match_stats(self) -> Tuple[int, int, int, int]:
+        """Return total_pgns, known_pgns, ddi_total, ddi_linked."""
+        total = len(self._li_pgn_index)
+        known = 0
+        spn_in_log: Set[int] = set()
+        if self._li_dbc.is_loaded:
+            for pgn, summary in self._li_pgn_index.items():
+                msg = self._li_dbc.get_message_for_pgn(pgn, summary.last_can_id)
+                if msg is None:
+                    continue
+                known += 1
+                if not summary.last_data:
+                    continue
+                try:
+                    decoded = msg.decode(
+                        summary.last_data, scaling=True, decode_choices=False)
+                    for sig_name in decoded:
+                        spn = self._li_dbc.get_spn_number(msg.frame_id, sig_name)
+                        if spn is not None:
+                            spn_in_log.add(spn)
+                except Exception:
+                    pass
+        ddi_total = self._li_isobus.count if self._li_isobus.is_loaded else 0
+        ddi_linked = (
+            self._li_isobus.count_sae_spn_matches(spn_in_log)
+            if self._li_isobus.is_loaded else 0)
+        return total, known, ddi_total, ddi_linked
+
+    def _li_format_stats_message(self, prefix: str = "") -> str:
+        total, known, ddi_total, ddi_linked = self._li_compute_match_stats()
+        parts = [prefix] if prefix else []
+        if self._li_pgn_index:
+            parts.append(f"Log: {total} unique PGNs")
+            if self._li_dbc.is_loaded:
+                parts.append(f"DBC: {known}/{total} known PGNs")
+            else:
+                parts.append("DBC: not loaded")
+        if self._li_isobus.is_loaded:
+            parts.append(f"ISOBUS: {ddi_total} DDI entries")
+            if self._li_pgn_index and self._li_dbc.is_loaded:
+                parts.append(f"{ddi_linked} DDIs linked via SAE SPN")
+        elif not parts:
+            parts.append("No log loaded")
+        return " | ".join(p for p in parts if p)
+
+    def _li_notify_stats(self, title: str, show_message: bool = True):
+        msg = self._li_format_stats_message()
+        self._li_status_var.set(msg)
+        if show_message:
+            messagebox.showinfo(title, msg)
+
+    def _li_browse_log(self):
+        path = filedialog.askopenfilename(
+            title="Select log file",
+            filetypes=[
+                ("Log files", "*.txt *.csv *.TXT *.CSV"),
+                ("All files", "*.*"),
+            ],
+            initialdir=os.path.dirname(self._li_log_path) if self._li_log_path else None,
+        )
+        if path:
+            self._li_log_path = path
+            self._li_log_path_var.set(path)
+            if path.lower().endswith(".csv"):
+                self._li_file_type_var.set("YonaCan CSV (.csv)")
+
+    def _li_browse_dbc(self):
+        path = filedialog.askopenfilename(
+            title="Select DBC for log import",
+            filetypes=[("DBC files", "*.dbc"), ("All files", "*.*")],
+            initialdir=os.path.dirname(self._li_dbc_path_var.get()) or None,
+        )
+        if path:
+            self._li_load_dbc_file(path)
+
+    def _li_browse_isobus(self):
+        path = filedialog.askopenfilename(
+            title="Select ISOBUS DDI dictionary",
+            filetypes=[
+                ("ISOBUS dictionary", "*.json *.txt"),
+                ("All files", "*.*"),
+            ],
+            initialdir=os.path.dirname(self._li_isobus_path_var.get()) or None,
+        )
+        if path:
+            self._li_load_isobus_file(path)
+
+    def _li_load_dbc_file(self, path: str, show_message: bool = True):
+        try:
+            if not DBCHandler.is_available():
+                messagebox.showerror("Missing Library", "Install cantools: pip install cantools")
+                return
+            self._li_dbc.load(path)
+            self._li_dbc_path_var.set(path)
+            self.settings["last_log_import_dbc_path"] = path
+            self.settings.save()
+            self._li_refresh_pgn_list()
+            if self._li_selected_pgn is not None:
+                self._li_populate_spn_tree(self._li_selected_pgn)
+            self._li_notify_stats("DBC loaded", show_message=show_message)
+        except Exception as e:
+            messagebox.showerror("DBC Load Error", str(e))
+
+    def _li_load_isobus_file(self, path: str, show_message: bool = True):
+        try:
+            n = self._li_isobus.load(path)
+            self._li_isobus_path_var.set(path)
+            self.settings["last_isobus_ddi_path"] = path
+            self.settings.save()
+            self._li_populate_ddi_tree()
+            if self._li_pgn_index:
+                self._li_notify_stats("ISOBUS dictionary loaded", show_message=show_message)
+            else:
+                self._li_status_var.set(f"ISOBUS: {n} DDI entries loaded")
+                if show_message:
+                    messagebox.showinfo(
+                        "ISOBUS dictionary loaded",
+                        f"Loaded {n} DDI entries from dictionary.\n\nLoad a log file to see PGN match counts.")
+        except Exception as e:
+            messagebox.showerror("ISOBUS Load Error", str(e))
+
+    def _li_start_load(self, show_message: bool = True):
+        if not self._li_log_path or not os.path.isfile(self._li_log_path):
+            messagebox.showwarning("No file", "Select a log file first.")
+            return
+        if self._li_scan_thread and self._li_scan_thread.is_alive():
+            self._li_scan_cancel = True
+            return
+        self._li_file_type = self._li_file_type_from_ui()
+        self.settings["last_log_import_path"] = self._li_log_path
+        self.settings["last_log_import_file_type"] = self._li_file_type.value
+        self.settings.save()
+        self._li_scan_cancel = False
+        self._li_status_var.set("Scanning log file…")
+        self._li_progress.start(10)
+        self._li_show_message_on_scan = show_message
+        self._li_scan_thread = threading.Thread(
+            target=self._li_scan_worker, daemon=True)
+        self._li_scan_thread.start()
+
+    def _li_scan_worker(self):
+        path = self._li_log_path
+        ft = self._li_file_type
+
+        def progress(done, total):
+            self.root.after(0, lambda: self._li_status_var.set(
+                f"Scanning… {done:,} lines" + (f" / ~{total:,}" if total else "")))
+
+        try:
+            index, session = scan_log(
+                path, ft, progress_cb=progress,
+                cancel_flag=lambda: self._li_scan_cancel)
+        except Exception as e:
+            self.root.after(0, lambda: self._li_on_scan_error(str(e)))
+            return
+        self.root.after(0, lambda: self._li_on_scan_complete(index, session))
+
+    def _li_on_scan_error(self, err: str):
+        self._li_progress.stop()
+        messagebox.showerror("Log scan failed", err)
+        self._li_status_var.set(f"Error: {err}")
+
+    def _li_on_scan_complete(self, index: Dict[int, PgnSummary], session: LogSessionInfo):
+        self._li_progress.stop()
+        self._li_pgn_index = index
+        self._li_session = session
+        self._li_pgn_cache.clear()
+        self._li_selected_pgn = None
+        for slot in list(self._li_graph_slots):
+            self._li_remove_graph(slot["spn_key"])
+        if self._li_byte_graph:
+            self._li_byte_graph.clear_series()
+            self._li_byte_graph.redraw()
+        self._li_spn_tree.delete(*self._li_spn_tree.get_children())
+        self._li_refresh_pgn_list()
+        self._li_populate_ddi_tree()
+        show = getattr(self, "_li_show_message_on_scan", True)
+        self._li_notify_stats("Log loaded", show_message=show)
+
+    def _li_pgn_display_name(self, pgn: int) -> str:
+        pgn_hex = f"0x{pgn:04X}"
+        if self._li_dbc.is_loaded:
+            msg = self._li_dbc.get_message_for_pgn(pgn)
+            if msg:
+                return f"{msg.name} — PGN {pgn} ({pgn_hex})"
+        return f"PGN {pgn} ({pgn_hex})"
+
+    def _li_refresh_pgn_list(self):
+        self._li_pgn_listbox.delete(0, tk.END)
+        self._li_pgn_list_data.clear()
+        filt = self._li_pgn_filter_var.get().strip().lower()
+        for pgn in sorted(self._li_pgn_index.keys()):
+            label = self._li_pgn_display_name(pgn)
+            count = self._li_pgn_index[pgn].count
+            row = f"{label}  [{count} frm]"
+            if filt and filt not in row.lower() and filt not in str(pgn):
+                continue
+            self._li_pgn_list_data.append((pgn, row))
+            self._li_pgn_listbox.insert(tk.END, row)
+
+    def _li_on_pgn_select(self, event=None):
+        sel = self._li_pgn_listbox.curselection()
+        if not sel or sel[0] >= len(self._li_pgn_list_data):
+            return
+        pgn = self._li_pgn_list_data[sel[0]][0]
+        self._li_selected_pgn = pgn
+        self._li_populate_spn_tree(pgn)
+        self._li_load_pgn_history(pgn)
+
+    def _li_populate_spn_tree(self, pgn: int):
+        self._li_spn_tree.delete(*self._li_spn_tree.get_children())
+        summary = self._li_pgn_index.get(pgn)
+        if not summary:
+            return
+        msg = None
+        if self._li_dbc.is_loaded:
+            msg = self._li_dbc.get_message_for_pgn(pgn, summary.last_can_id)
+        if msg is None:
+            raw = summary.last_data.hex(" ").upper() if summary.last_data else "--"
+            self._li_spn_tree.insert("", tk.END, values=(
+                f"Raw data (no DBC match)", "", raw, ""))
+            return
+        decoded = {}
+        try:
+            decoded = msg.decode(summary.last_data, scaling=True, decode_choices=False)
+        except Exception:
+            pass
+        for sig in sorted(msg.signals, key=lambda s: s.name):
+            spn_num = self._li_dbc.get_spn_number(msg.frame_id, sig.name)
+            spn_str = str(spn_num) if spn_num is not None else ""
+            val = decoded.get(sig.name, "--")
+            if isinstance(val, float):
+                val_str = f"{val:.4g}"
+            else:
+                val_str = str(val)
+            unit = getattr(sig, "unit", "") or ""
+            self._li_spn_tree.insert("", tk.END, iid=f"{msg.name}.{sig.name}",
+                                     values=(sig.name, spn_str, val_str, unit))
+
+    def _li_max_history_frames(self) -> int:
+        try:
+            return max(500, int(self._li_max_points_var.get()))
+        except ValueError:
+            return 5000
+
+    def _li_load_pgn_history(self, pgn: int):
+        """Background load frame history for graphs (cached per PGN)."""
+        if not self._li_log_path:
+            return
+        if pgn in self._li_pgn_cache:
+            self._li_apply_pgn_cache(pgn)
+            return
+
+        self._li_status_var.set(f"Loading history for PGN {pgn}…")
+
+        def worker():
+            ft = self._li_file_type
+            path = self._li_log_path
+            max_f = self._li_max_history_frames()
+            msg = None
+            if self._li_dbc.is_loaded:
+                s = self._li_pgn_index.get(pgn)
+                if s:
+                    msg = self._li_dbc.get_message_for_pgn(pgn, s.last_can_id)
+            byte_pts: List[List[Tuple[float, float]]] = [[] for _ in range(8)]
+            spn_pts: Dict[str, List[Tuple[float, float]]] = {}
+            for frame in iter_frames_for_pgn(
+                    path, ft, pgn, max_frames=max_f, session=self._li_session):
+                for i in range(min(8, len(frame.data))):
+                    byte_pts[i].append((frame.timestamp, frame.data[i]))
+                if msg:
+                    try:
+                        decoded = msg.decode(
+                            frame.data, scaling=True, decode_choices=False)
+                        for sig_name, value in decoded.items():
+                            key = f"{msg.name}.{sig_name}"
+                            try:
+                                fval = float(value)
+                            except (TypeError, ValueError):
+                                continue
+                            spn_pts.setdefault(key, []).append(
+                                (frame.timestamp, fval))
+                    except Exception:
+                        pass
+            cache = {"bytes": byte_pts, "spns": spn_pts, "msg": msg}
+            self._li_pgn_cache[pgn] = cache
+            self.root.after(0, lambda: self._li_apply_pgn_cache(pgn))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _li_apply_pgn_cache(self, pgn: int):
+        cache = self._li_pgn_cache.get(pgn)
+        if not cache or not self._li_byte_graph:
+            return
+        series = []
+        for i in range(8):
+            pts = cache["bytes"][i]
+            if not pts:
+                continue
+            visible = self._li_byte_btns[i].cget("relief") == tk.SUNKEN
+            series.append(TimeSeries(
+                label=f"B{i}",
+                color=self._byte_colors[i],
+                points=pts,
+                visible=visible,
+                y_auto=not self._li_byte_graph.y_fixed_0_255,
+                y_min=0.0,
+                y_max=255.0,
+            ))
+        self._li_byte_graph.max_draw_points = self._li_max_history_frames()
+        self._li_byte_graph.set_series(series)
+        for slot in self._li_graph_slots:
+            key = slot["spn_key"]
+            if key in cache["spns"]:
+                slot["graph"].series = [
+                    TimeSeries(
+                        label=key.split(".", 1)[-1],
+                        color=slot["color"],
+                        points=cache["spns"][key],
+                        y_auto=True,
+                    )
+                ]
+                slot["graph"].home()
+        self._li_notify_stats("PGN history loaded", show_message=False)
+
+    def _li_on_spn_click(self, event):
+        if self._li_viz_mode_var.get() != "spns":
+            return
+        row = self._li_spn_tree.identify_row(event.y)
+        if not row:
+            return
+        spn_key = row
+        if spn_key in self._li_selected_graph_spns:
+            self._li_remove_graph(spn_key)
+        else:
+            if len(self._li_selected_graph_spns) >= 5:
+                messagebox.showwarning("Graph limit", "Maximum 5 SPN graphs.")
+                return
+            self._li_add_graph(spn_key)
+
+    def _li_on_viz_mode_change(self):
+        mode = self._li_viz_mode_var.get()
+        self.settings["last_log_import_viz_mode"] = mode
+        try:
+            self.settings["log_import_max_plot_points"] = int(
+                self._li_max_points_var.get())
+        except ValueError:
+            pass
+        self.settings.save()
+        for f in (self._li_bytes_frame, self._li_spns_frame, self._li_ddi_frame):
+            f.pack_forget()
+        if mode == "bytes":
+            self._li_bytes_frame.pack(fill=tk.BOTH, expand=True)
+        elif mode == "spns":
+            self._li_spns_frame.pack(fill=tk.BOTH, expand=True)
+        else:
+            self._li_ddi_frame.pack(fill=tk.BOTH, expand=True)
+            self._li_populate_ddi_tree()
+
+    def _li_toggle_byte_y_scale(self):
+        if self._li_byte_graph:
+            self._li_byte_graph.set_y_fixed_0_255(
+                not self._li_byte_graph.y_fixed_0_255)
+
+    def _li_toggle_byte(self, idx: int):
+        btn = self._li_byte_btns[idx]
+        sunken = btn.cget("relief") == tk.SUNKEN
+        btn.configure(relief=tk.RAISED if sunken else tk.SUNKEN)
+        if self._li_selected_pgn is not None:
+            self._li_apply_pgn_cache(self._li_selected_pgn)
+        elif self._li_byte_graph:
+            self._li_byte_graph.redraw()
+
+    def _li_popout_graph(self, graph: Optional[LogGraphView], title: str):
+        self._li_popout_with_byte_bar(graph, title)
+
+    def _li_add_graph(self, spn_key: str):
+        if len(self._li_graph_slots) >= 5:
+            return
+        color = self._li_graph_colors[len(self._li_graph_slots) % len(self._li_graph_colors)]
+        slot = {"spn_key": spn_key, "color": color}
+        outer = ttk.LabelFrame(
+            self._li_spn_graph_host, text=spn_key.split(".", 1)[-1], padding=4)
+        outer.pack(fill=tk.BOTH, expand=True, pady=2)
+        slot["frame"] = outer
+        canvas = tk.Canvas(outer, height=140, bg=COLORS["bg_dark"], highlightthickness=0)
+        gv = LogGraphView(canvas, max_draw_points=self._li_max_history_frames())
+        self._register_graph_view(gv)
+        attach_graph_toolbar(
+            outer, gv,
+            on_popout=lambda g=gv, k=spn_key: self._li_popout_graph(g, k),
+            max_points_var=None,
+            on_plot_mode_toggle=self._toggle_graph_plot_mode,
+            plot_mode_label=self._graph_plot_mode_btn,
+        )
+        canvas.pack(fill=tk.BOTH, expand=True)
+        slot["graph"] = gv
+        slot["canvas"] = canvas
+        hdr = ttk.Frame(outer)
+        hdr.pack(fill=tk.X)
+        ttk.Button(hdr, text="Remove", width=8,
+                   command=lambda k=spn_key: self._li_remove_graph(k)).pack(side=tk.RIGHT)
+        self._li_graph_slots.append(slot)
+        self._li_selected_graph_spns.append(spn_key)
+        if self._li_selected_pgn is not None:
+            cache = self._li_pgn_cache.get(self._li_selected_pgn)
+            if cache and spn_key in cache["spns"]:
+                gv.set_series([
+                    TimeSeries(
+                        label=spn_key.split(".", 1)[-1],
+                        color=color,
+                        points=cache["spns"][spn_key],
+                        y_auto=True,
+                    )
+                ])
+
+    def _li_remove_graph(self, spn_key: str):
+        if spn_key in self._li_selected_graph_spns:
+            self._li_selected_graph_spns.remove(spn_key)
+        for slot in list(self._li_graph_slots):
+            if slot["spn_key"] == spn_key:
+                slot["frame"].destroy()
+                self._li_graph_slots.remove(slot)
+                break
+
+    def _li_populate_ddi_tree(self):
+        self._li_ddi_tree.delete(*self._li_ddi_tree.get_children())
+        if not self._li_isobus.is_loaded:
+            return
+        q = self._li_ddi_search_var.get().strip()
+        items = self._li_isobus.search(q, limit=300) if q else sorted(
+            self._li_isobus.entries.values(), key=lambda e: e.ddi)[:300]
+        for info in items:
+            tag = ()
+            if info.sae_spn is not None and self._li_pgn_index:
+                tag = ("linked",)
+            self._li_ddi_tree.insert(
+                "", tk.END, iid=str(info.ddi),
+                values=(info.ddi, info.name[:60], info.unit[:30]), tags=tag)
+        self._li_ddi_tree.tag_configure("linked", foreground=COLORS["success"])
+
+    def _li_on_ddi_select(self, event=None):
+        sel = self._li_ddi_tree.selection()
+        if not sel:
+            return
+        try:
+            ddi = int(sel[0])
+        except ValueError:
+            return
+        info = self._li_isobus.get(ddi)
+        if not info:
+            return
+        self._li_ddi_detail.configure(state=tk.NORMAL)
+        self._li_ddi_detail.delete("1.0", tk.END)
+        self._li_ddi_detail.insert(tk.END, f"DDI {info.ddi}: {info.name}\n\n")
+        self._li_ddi_detail.insert(tk.END, f"Definition:\n{info.definition}\n\n")
+        if info.comment:
+            self._li_ddi_detail.insert(tk.END, f"Comment:\n{info.comment}\n\n")
+        if info.unit:
+            self._li_ddi_detail.insert(tk.END, f"Unit: {info.unit}\n")
+        if info.resolution is not None:
+            self._li_ddi_detail.insert(tk.END, f"Resolution: {info.resolution}\n")
+        if info.sae_spn is not None:
+            self._li_ddi_detail.insert(tk.END, f"SAE SPN: {info.sae_spn}\n")
+        self._li_ddi_detail.configure(state=tk.DISABLED)
+
+    # ========================================================================
+    # ISO BUS Raw Data Tab
+    # ========================================================================
+
+    def _register_graph_view(self, graph: LogGraphView):
+        if graph not in self._graph_views:
+            self._graph_views.append(graph)
+        graph.set_plot_mode(self._graph_plot_mode)
+
+    def _toggle_graph_plot_mode(self):
+        self._graph_plot_mode = (
+            "scatter" if self._graph_plot_mode == "line" else "line")
+        self._graph_plot_mode_btn.set(
+            "Scatter" if self._graph_plot_mode == "scatter" else "Line")
+        self.settings["graph_plot_mode"] = self._graph_plot_mode
+        self.settings.save()
+        for gv in self._graph_views:
+            gv.set_plot_mode(self._graph_plot_mode)
+
+    def _create_isobus_tab(self, parent):
+        """ISO BUS proprietary PGN (e.g. 61184): message-type ids and payload bytes."""
+        toolbar = ttk.Frame(parent, style="Medium.TFrame", padding=6)
+        toolbar.pack(fill=tk.X, padx=5, pady=5)
+
+        row1 = ttk.Frame(toolbar, style="Medium.TFrame")
+        row1.pack(fill=tk.X, pady=(0, 4))
+        ttk.Label(row1, text="Log:", style="Medium.TLabel").pack(side=tk.LEFT)
+        self._ib_log_path_var = tk.StringVar(value="No log loaded")
+        ttk.Entry(row1, textvariable=self._ib_log_path_var, width=42,
+                  state="readonly").pack(side=tk.LEFT, fill=tk.X, expand=True, padx=4)
+        ttk.Button(row1, text="Browse", command=self._ib_browse_log,
+                   style="Accent.TButton", width=8).pack(side=tk.LEFT, padx=2)
+        self._ib_file_type_var = tk.StringVar(value="CSS CL2000 (.txt)")
+        ttk.Combobox(
+            row1, textvariable=self._ib_file_type_var, width=18, state="readonly",
+            values=["CSS CL2000 (.txt)", "YonaCan CSV (.csv)"],
+        ).pack(side=tk.LEFT, padx=4)
+        ttk.Button(row1, text="Load", command=self._ib_start_load,
+                   style="Accent.TButton", width=8).pack(side=tk.LEFT, padx=2)
+
+        row2 = ttk.Frame(toolbar, style="Medium.TFrame")
+        row2.pack(fill=tk.X, pady=(0, 4))
+        ttk.Label(row2, text="Raw PGN:", style="Medium.TLabel").pack(side=tk.LEFT)
+        self._ib_pgn_var = tk.StringVar(value=str(DEFAULT_RAW_DATA_PGN))
+        ttk.Entry(row2, textvariable=self._ib_pgn_var, width=10).pack(side=tk.LEFT, padx=4)
+        ttk.Label(row2, text="(61184 = 0xEF00)", style="Status.TLabel").pack(side=tk.LEFT)
+
+        ttk.Button(row2, text="Scan", command=self._ib_start_load,
+                   style="Accent.TButton", width=8).pack(side=tk.LEFT, padx=(12, 2))
+
+        row_id = ttk.Frame(toolbar, style="Medium.TFrame")
+        row_id.pack(fill=tk.X, pady=(0, 4))
+        ttk.Label(
+            row_id,
+            text="Identifier bytes (must be consecutive):",
+            style="Medium.TLabel",
+        ).pack(side=tk.LEFT)
+        self._ib_id_byte_frame = ttk.Frame(row_id, style="Medium.TFrame")
+        self._ib_id_byte_frame.pack(side=tk.LEFT, padx=8)
+        self._ib_id_byte_vars.clear()
+        for i in range(8):
+            var = tk.BooleanVar(value=(i == 0))
+            self._ib_id_byte_vars.append(var)
+            tk.Checkbutton(
+                self._ib_id_byte_frame,
+                text=f"B{i}",
+                variable=var,
+                bg=COLORS["bg_medium"],
+                fg=COLORS["fg_primary"],
+                selectcolor=COLORS["bg_dark"],
+                activebackground=COLORS["bg_medium"],
+                activeforeground=COLORS["fg_primary"],
+            ).pack(side=tk.LEFT, padx=2)
+
+        self._ib_status_var = tk.StringVar(
+            value="Check consecutive B0–B7 boxes for the identifier, then Scan")
+        ttk.Label(toolbar, textvariable=self._ib_status_var,
+                  style="Status.TLabel", wraplength=900).pack(fill=tk.X, pady=(4, 0))
+        self._ib_progress = ttk.Progressbar(toolbar, mode="indeterminate")
+        self._ib_progress.pack(fill=tk.X, pady=(4, 0))
+
+        paned = ttk.PanedWindow(parent, orient=tk.HORIZONTAL)
+        paned.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+
+        left = ttk.Frame(paned, style="Medium.TFrame", padding=8)
+        paned.add(left, weight=1)
+        ttk.Label(left, text="Message types (identifier)", style="Title.TLabel").pack(anchor=tk.W)
+        filt_row = ttk.Frame(left, style="Medium.TFrame")
+        filt_row.pack(fill=tk.X, pady=4)
+        ttk.Label(filt_row, text="Filter:", style="Medium.TLabel").pack(side=tk.LEFT)
+        self._ib_type_filter_var = tk.StringVar()
+        self._ib_type_filter_var.trace_add(
+            "write", lambda *_: self._ib_refresh_type_list())
+        ttk.Entry(filt_row, textvariable=self._ib_type_filter_var, width=20).pack(
+            side=tk.LEFT, fill=tk.X, expand=True, padx=4)
+        lf = ttk.Frame(left)
+        lf.pack(fill=tk.BOTH, expand=True)
+        self._ib_type_listbox = tk.Listbox(
+            lf, bg=COLORS["bg_dark"], fg=COLORS["fg_primary"],
+            selectbackground=COLORS["accent"], font=("Consolas", 10), activestyle="none")
+        self._ib_type_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self._ib_type_listbox.bind("<<ListboxSelect>>", self._ib_on_type_select)
+        sb = ttk.Scrollbar(lf, orient=tk.VERTICAL, command=self._ib_type_listbox.yview)
+        self._ib_type_listbox.configure(yscrollcommand=sb.set)
+        sb.pack(side=tk.RIGHT, fill=tk.Y)
+
+        center = ttk.Frame(paned, style="Medium.TFrame", padding=8)
+        paned.add(center, weight=1)
+        ttk.Label(center, text="Last frame", style="Title.TLabel").pack(anchor=tk.W)
+        self._ib_frame_detail = tk.Text(
+            center, height=14, bg=COLORS["bg_dark"], fg=COLORS["fg_primary"],
+            font=("Consolas", 10), wrap=tk.WORD, state=tk.DISABLED)
+        self._ib_frame_detail.pack(fill=tk.BOTH, expand=True, pady=4)
+
+        right = ttk.LabelFrame(paned, text="Payload bytes over time", padding=8)
+        paned.add(right, weight=3)
+        self._ib_graph_frame = ttk.Frame(right, style="Dark.TFrame")
+        self._ib_graph_frame.pack(fill=tk.BOTH, expand=True)
+        self._ib_byte_graph = LogGraphView(
+            tk.Canvas(self._ib_graph_frame, bg=COLORS["bg_dark"], highlightthickness=0),
+            max_draw_points=2500,
+            y_fixed_0_255=True,
+            hover_enabled=True,
+            value_as_int=True,
+        )
+        self._register_graph_view(self._ib_byte_graph)
+        self._ib_byte_canvas = self._ib_byte_graph.canvas
+        attach_graph_toolbar(
+            self._ib_graph_frame, self._ib_byte_graph,
+            on_popout=lambda: self._ib_popout_graph(),
+            max_points_var=self._ib_max_points_var,
+            on_y_0_255=self._ib_toggle_byte_y_scale,
+            on_plot_mode_toggle=self._toggle_graph_plot_mode,
+            plot_mode_label=self._graph_plot_mode_btn,
+        )
+        self._ib_byte_canvas.pack(fill=tk.BOTH, expand=True)
+        bl = ttk.Frame(right)
+        bl.pack(fill=tk.X, pady=4)
+        ttk.Label(bl, text="Plot bytes:", style="Medium.TLabel").pack(side=tk.LEFT, padx=(0, 4))
+        self._ib_byte_btn_row = ttk.Frame(bl, style="Medium.TFrame")
+        self._ib_byte_btn_row.pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+    def _ib_restore_defaults(self):
+        pgn = self.settings.get("isobus_raw_pgn", DEFAULT_RAW_DATA_PGN)
+        self._ib_pgn_var.set(str(pgn))
+        saved_idx = self.settings.get("isobus_raw_id_indices")
+        if not saved_idx:
+            n = int(self.settings.get("isobus_raw_id_bytes", 1) or 1)
+            saved_idx = list(range(max(1, min(n, 8))))
+        self._ib_set_id_checkboxes(saved_idx)
+        pts = self.settings.get("log_import_max_plot_points", 2500)
+        self._ib_max_points_var.set(str(pts))
+        log_path = self.settings.get("last_log_import_path", "")
+        if log_path and os.path.isfile(log_path):
+            self._ib_log_path = log_path
+            self._ib_log_path_var.set(log_path)
+            ft = self.settings.get("last_log_import_file_type", "cl2000")
+            self._ib_file_type_var.set(
+                "YonaCan CSV (.csv)" if ft == "yonacan_csv" else "CSS CL2000 (.txt)")
+            self._ib_start_load(show_message=False)
+
+    def _ib_file_type_from_ui(self) -> LogFileType:
+        if "csv" in self._ib_file_type_var.get().lower():
+            return LogFileType.YONACAN_CSV
+        return LogFileType.CL2000
+
+    def _ib_get_id_indices_from_ui(self) -> List[int]:
+        return [i for i, var in enumerate(self._ib_id_byte_vars) if var.get()]
+
+    def _ib_set_id_checkboxes(self, indices: List[int]):
+        idx_set = set(indices)
+        for i, var in enumerate(self._ib_id_byte_vars):
+            var.set(i in idx_set)
+
+    def _ib_validate_id_selection(self) -> Optional[Tuple[int, ...]]:
+        """Return normalized id indices, or None after showing an error dialog."""
+        indices = self._ib_get_id_indices_from_ui()
+        err = validate_id_byte_indices(indices)
+        if err:
+            messagebox.showerror("Identifier bytes", err)
+            return None
+        return normalize_id_indices(indices)
+
+    def _ib_parse_config(self) -> Tuple[int, Tuple[int, ...]]:
+        raw_pgn = parse_pgn_value(self._ib_pgn_var.get())
+        id_indices = self._ib_validate_id_selection()
+        if id_indices is None:
+            raise ValueError("invalid identifier byte selection")
+        return raw_pgn, id_indices
+
+    def _ib_save_config(self, raw_pgn: int, id_indices: Tuple[int, ...]):
+        self.settings["isobus_raw_pgn"] = raw_pgn
+        self.settings["isobus_raw_id_indices"] = list(id_indices)
+        if self._ib_log_path:
+            self.settings["last_log_import_path"] = self._ib_log_path
+            self.settings["last_log_import_file_type"] = self._ib_file_type.value
+        self.settings.save()
+
+    def _ib_browse_log(self):
+        path = filedialog.askopenfilename(
+            title="Select log file",
+            filetypes=[
+                ("Log files", "*.txt *.csv *.TXT *.CSV"),
+                ("All files", "*.*"),
+            ],
+            initialdir=os.path.dirname(self._ib_log_path) if self._ib_log_path else None,
+        )
+        if path:
+            self._ib_log_path = path
+            self._ib_log_path_var.set(path)
+            if path.lower().endswith(".csv"):
+                self._ib_file_type_var.set("YonaCan CSV (.csv)")
+
+    def _ib_start_load(self, show_message: bool = True):
+        if not self._ib_log_path or not os.path.isfile(self._ib_log_path):
+            messagebox.showwarning("No file", "Select a log file first.")
+            return
+        try:
+            raw_pgn, id_indices = self._ib_parse_config()
+        except ValueError as e:
+            if str(e) != "invalid identifier byte selection":
+                messagebox.showerror("Configuration", str(e))
+            return
+        if self._ib_scan_thread and self._ib_scan_thread.is_alive():
+            self._ib_scan_cancel = True
+            return
+        self._ib_file_type = self._ib_file_type_from_ui()
+        self._ib_save_config(raw_pgn, id_indices)
+        self._ib_scan_cancel = False
+        self._ib_status_var.set("Scanning for ISO BUS raw messages…")
+        self._ib_progress.start(10)
+        self._ib_show_message_on_scan = show_message
+        self._ib_id_indices = id_indices
+        self._ib_scan_thread = threading.Thread(
+            target=self._ib_scan_worker, daemon=True,
+            args=(raw_pgn, id_indices))
+        self._ib_scan_thread.start()
+
+    def _ib_scan_worker(self, raw_pgn: int, id_indices: Tuple[int, ...]):
+        path = self._ib_log_path
+        ft = self._ib_file_type
+
+        def progress(done, total):
+            self.root.after(0, lambda: self._ib_status_var.set(
+                f"Scanning… {done:,} lines"
+                + (f" / ~{total:,}" if total else "")))
+
+        try:
+            index, session = scan_isobus_raw_log(
+                path, ft, raw_pgn=raw_pgn, id_indices=id_indices,
+                progress_cb=progress,
+                cancel_flag=lambda: self._ib_scan_cancel)
+        except Exception as e:
+            self.root.after(0, lambda: self._ib_on_scan_error(str(e)))
+            return
+        self.root.after(0, lambda: self._ib_on_scan_complete(index, session, raw_pgn))
+
+    def _ib_on_scan_error(self, err: str):
+        self._ib_progress.stop()
+        messagebox.showerror("Scan failed", err)
+        self._ib_status_var.set(f"Error: {err}")
+
+    def _ib_on_scan_complete(
+            self, index: Dict[MessageKey, IsobusTypeSummary],
+            session: LogSessionInfo, raw_pgn: int):
+        self._ib_progress.stop()
+        self._ib_type_index = index
+        self._ib_session = session
+        self._ib_type_cache.clear()
+        self._ib_selected_type = None
+        if self._ib_byte_graph:
+            self._ib_byte_graph.clear_series()
+            self._ib_byte_graph.redraw()
+        self._ib_refresh_type_list()
+        total_frm = sum(s.count for s in index.values())
+        show = getattr(self, "_ib_show_message_on_scan", True)
+        id_lbl = format_id_indices_label(self._ib_id_indices)
+        msg = (
+            f"PGN {raw_pgn} (0x{raw_pgn:04X}), ID {id_lbl}: "
+            f"{len(index)} message types, {total_frm:,} frames")
+        self._ib_status_var.set(msg)
+        if show:
+            messagebox.showinfo("ISO BUS scan", msg)
+
+    def _ib_refresh_type_list(self):
+        self._ib_type_listbox.delete(0, tk.END)
+        self._ib_type_list_data.clear()
+        filt = self._ib_type_filter_var.get().strip().lower()
+        for mkey in sorted(self._ib_type_index.keys()):
+            summary = self._ib_type_index[mkey]
+            label = format_message_key(mkey)
+            row = f"{label}  [{summary.count:,} frm]"
+            if filt and filt not in row.lower() and filt not in label.lower():
+                hex_only = "".join(f"{b:02x}" for b in mkey)
+                if filt not in hex_only:
+                    continue
+            self._ib_type_list_data.append((mkey, row))
+            self._ib_type_listbox.insert(tk.END, row)
+
+    def _ib_on_type_select(self, event=None):
+        sel = self._ib_type_listbox.curselection()
+        if not sel or sel[0] >= len(self._ib_type_list_data):
+            return
+        mid = self._ib_type_list_data[sel[0]][0]
+        self._ib_selected_type = mid
+        self._ib_show_frame_detail(mid)
+        self._ib_rebuild_byte_buttons(mid)
+        self._ib_load_type_history(mid)
+
+    def _ib_show_frame_detail(self, message_key: MessageKey):
+        summary = self._ib_type_index.get(message_key)
+        if not summary:
+            return
+        id_set = set(self._ib_id_indices)
+        data = summary.last_data
+        lines = [
+            f"Message ID: {format_message_key(message_key)}",
+            f"ID bytes: {format_id_indices_label(self._ib_id_indices)}",
+            f"Frames: {summary.count:,}",
+            f"CAN ID: 0x{summary.last_can_id:08X}",
+            f"DLC: {len(data)}",
+            "",
+            "Bytes:",
+        ]
+        payload_parts: List[str] = []
+        for i, b in enumerate(data):
+            role = " (ID)" if i in id_set else ""
+            if i not in id_set:
+                payload_parts.append(f"{b:02X}")
+            lines.append(f"  B{i}: 0x{b:02X} ({b:3d}){role}")
+        if payload_parts:
+            lines.append("")
+            lines.append(f"Other bytes hex: {' '.join(payload_parts)}")
+        self._ib_frame_detail.configure(state=tk.NORMAL)
+        self._ib_frame_detail.delete("1.0", tk.END)
+        self._ib_frame_detail.insert(tk.END, "\n".join(lines))
+        self._ib_frame_detail.configure(state=tk.DISABLED)
+
+    def _ib_rebuild_byte_buttons(self, message_key: MessageKey):
+        for btn in self._ib_byte_btns:
+            btn.destroy()
+        self._ib_byte_btns.clear()
+        summary = self._ib_type_index.get(message_key)
+        if not summary:
+            return
+        indices = payload_byte_indices(self._ib_id_indices, summary.max_data_len)
+        colors = getattr(self, "_byte_colors", self._li_graph_colors)
+        for i in indices:
+            if i >= len(self._ib_byte_active):
+                self._ib_byte_active.extend([True] * (i + 1 - len(self._ib_byte_active)))
+            active = self._ib_byte_active[i]
+            btn = tk.Button(
+                self._ib_byte_btn_row, text=f"B{i}", width=3,
+                bg=colors[i % len(colors)],
+                fg="white",
+                relief=tk.SUNKEN if active else tk.RAISED,
+                command=lambda idx=i: self._ib_toggle_byte(idx),
+            )
+            btn.pack(side=tk.LEFT, padx=1)
+            self._ib_byte_btns.append(btn)
+
+    def _ib_max_history_frames(self) -> int:
+        try:
+            return max(500, int(self._ib_max_points_var.get()))
+        except ValueError:
+            return 5000
+
+    def _ib_load_type_history(self, message_key: MessageKey):
+        if not self._ib_log_path:
+            return
+        if message_key in self._ib_type_cache:
+            self._ib_apply_type_cache(message_key)
+            return
+        try:
+            raw_pgn = parse_pgn_value(self._ib_pgn_var.get())
+        except ValueError:
+            return
+        self._ib_status_var.set(
+            f"Loading history for {format_message_key(message_key)}…")
+
+        def worker():
+            cache = build_type_history_cache(
+                self._ib_log_path, self._ib_file_type, raw_pgn, message_key,
+                self._ib_id_indices, self._ib_max_history_frames(),
+                self._ib_session)
+            self._ib_type_cache[message_key] = cache
+            self.root.after(0, lambda: self._ib_apply_type_cache(message_key))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _ib_apply_type_cache(self, message_key: MessageKey):
+        cache = self._ib_type_cache.get(message_key)
+        if not cache or not self._ib_byte_graph:
+            return
+        indices = payload_byte_indices(
+            self._ib_id_indices, cache.get("max_len", 8))
+        colors = getattr(self, "_byte_colors", self._li_graph_colors)
+        series = []
+        for i in indices:
+            pts = cache["bytes"][i]
+            if not pts:
+                continue
+            active = i < len(self._ib_byte_active) and self._ib_byte_active[i]
+            for j, btn in enumerate(self._ib_byte_btns):
+                if btn.cget("text") == f"B{i}":
+                    active = btn.cget("relief") == tk.SUNKEN
+                    break
+            series.append(TimeSeries(
+                label=f"B{i}",
+                color=colors[i % len(colors)],
+                points=pts,
+                visible=active,
+                y_auto=not self._ib_byte_graph.y_fixed_0_255,
+                y_min=0.0,
+                y_max=255.0,
+            ))
+        self._ib_byte_graph.max_draw_points = self._ib_max_history_frames()
+        self._ib_byte_graph.set_series(series)
+        self._ib_status_var.set(
+            f"Loaded plot data for {format_message_key(message_key)}")
+
+    def _ib_toggle_byte(self, idx: int):
+        if idx < len(self._ib_byte_active):
+            self._ib_byte_active[idx] = not self._ib_byte_active[idx]
+        for btn in self._ib_byte_btns:
+            if btn.cget("text") == f"B{idx}":
+                sunken = btn.cget("relief") == tk.SUNKEN
+                btn.configure(relief=tk.RAISED if sunken else tk.SUNKEN)
+                break
+        if self._ib_selected_type is not None:
+            self._ib_apply_type_cache(self._ib_selected_type)
+        elif self._ib_byte_graph:
+            self._ib_byte_graph.redraw()
+
+    def _ib_toggle_byte_y_scale(self):
+        if self._ib_byte_graph:
+            self._ib_byte_graph.set_y_fixed_0_255(
+                not self._ib_byte_graph.y_fixed_0_255)
+
+    def _ib_build_byte_toggle_row(
+            self, parent: tk.Widget, graph: LogGraphView,
+            on_toggle: Callable[[int], None]) -> ttk.Frame:
+        row = ttk.Frame(parent)
+        row.pack(fill=tk.X, pady=4)
+        ttk.Label(row, text="Plot bytes:", style="Medium.TLabel").pack(
+            side=tk.LEFT, padx=(0, 4))
+        btn_frame = ttk.Frame(row, style="Medium.TFrame")
+        btn_frame.pack(side=tk.LEFT)
+        mid = self._ib_selected_type
+        indices: List[int] = []
+        if mid is not None and mid in self._ib_type_index:
+            summary = self._ib_type_index[mid]
+            indices = payload_byte_indices(
+                self._ib_id_indices, summary.max_data_len)
+        colors = getattr(self, "_byte_colors", self._li_graph_colors)
+        pop_btns: List[tk.Button] = []
+
+        def toggle(idx: int):
+            on_toggle(idx)
+            self._ib_sync_byte_buttons_from_graph(graph)
+
+        for i in indices:
+            active = i < len(self._ib_byte_active) and self._ib_byte_active[i]
+            for btn in self._ib_byte_btns:
+                if btn.cget("text") == f"B{i}":
+                    active = btn.cget("relief") == tk.SUNKEN
+                    break
+            btn = tk.Button(
+                btn_frame, text=f"B{i}", width=3,
+                bg=colors[i % len(colors)], fg="white",
+                relief=tk.SUNKEN if active else tk.RAISED,
+                command=lambda idx=i: toggle(idx),
+            )
+            btn.pack(side=tk.LEFT, padx=1)
+            pop_btns.append(btn)
+        return row
+
+    def _ib_sync_byte_buttons_from_graph(self, graph: LogGraphView):
+        visible = {s.label for s in graph.series if s.visible}
+        for btn in self._ib_byte_btns:
+            lbl = btn.cget("text")
+            btn.configure(relief=tk.SUNKEN if lbl in visible else tk.RAISED)
+
+    def _ib_popout_graph(self):
+        graph = self._ib_byte_graph
+        if graph is None or not graph.series:
+            messagebox.showinfo("Pop out", "Select a message type and load data first.")
+            return
+        if self._ib_popout_window is not None:
+            try:
+                self._ib_popout_window.destroy()
+            except tk.TclError:
+                pass
+        win = tk.Toplevel(self.root)
+        win.title("ISO BUS raw — payload bytes")
+        win.geometry("1200x700")
+        win.configure(bg=COLORS["bg_dark"])
+        self._ib_popout_window = win
+        frame = ttk.Frame(win, style="Dark.TFrame", padding=8)
+        frame.pack(fill=tk.BOTH, expand=True)
+        canvas = tk.Canvas(frame, bg=COLORS["bg_dark"], highlightthickness=0)
+        pop = LogGraphView(
+            canvas,
+            max_draw_points=graph.max_draw_points,
+            y_fixed_0_255=graph.y_fixed_0_255,
+            hover_enabled=True,
+            value_as_int=True,
+        )
+        pop.copy_state_from(graph)
+        self._register_graph_view(pop)
+        attach_graph_toolbar(
+            frame, pop,
+            on_popout=None,
+            max_points_var=self._ib_max_points_var,
+            on_y_0_255=lambda g=pop: g.set_y_fixed_0_255(not g.y_fixed_0_255),
+            on_plot_mode_toggle=self._toggle_graph_plot_mode,
+            plot_mode_label=self._graph_plot_mode_btn,
+        )
+        canvas.pack(fill=tk.BOTH, expand=True)
+
+        def pop_toggle(idx: int):
+            self._ib_toggle_byte(idx)
+            pop.copy_state_from(self._ib_byte_graph)
+
+        self._ib_build_byte_toggle_row(frame, pop, pop_toggle)
+        win.bind("<Destroy>", lambda e: setattr(self, "_ib_popout_window", None))
+
+    def _li_popout_with_byte_bar(self, graph: LogGraphView, title: str, byte_count: int = 8):
+        """Pop out log-import byte graph with byte toggles and plot mode."""
+        if graph is None or not graph.series:
+            messagebox.showinfo("Pop out", "Load a PGN and select data to graph first.")
+            return
+        if self._li_popout_window is not None:
+            try:
+                self._li_popout_window.destroy()
+            except tk.TclError:
+                pass
+        win = tk.Toplevel(self.root)
+        win.title(title)
+        win.geometry("1200x700")
+        win.configure(bg=COLORS["bg_dark"])
+        self._li_popout_window = win
+        frame = ttk.Frame(win, style="Dark.TFrame", padding=8)
+        frame.pack(fill=tk.BOTH, expand=True)
+        canvas = tk.Canvas(frame, bg=COLORS["bg_dark"], highlightthickness=0)
+        pop = LogGraphView(
+            canvas,
+            max_draw_points=graph.max_draw_points,
+            y_fixed_0_255=graph.y_fixed_0_255,
+            hover_enabled=True,
+            value_as_int=graph.value_as_int,
+        )
+        pop.copy_state_from(graph)
+        self._register_graph_view(pop)
+        attach_graph_toolbar(
+            frame, pop,
+            on_popout=None,
+            max_points_var=self._li_max_points_var,
+            on_y_0_255=lambda g=pop: g.set_y_fixed_0_255(not g.y_fixed_0_255),
+            on_plot_mode_toggle=self._toggle_graph_plot_mode,
+            plot_mode_label=self._graph_plot_mode_btn,
+        )
+        canvas.pack(fill=tk.BOTH, expand=True)
+        bl = ttk.Frame(frame)
+        bl.pack(fill=tk.X, pady=4)
+        ttk.Label(bl, text="Plot bytes:", style="Medium.TLabel").pack(side=tk.LEFT, padx=(0, 4))
+        colors = getattr(self, "_byte_colors", self._li_graph_colors)
+
+        pop_btns: List[tk.Button] = []
+        for i in range(byte_count):
+            sunken = (
+                i < len(self._li_byte_btns)
+                and self._li_byte_btns[i].cget("relief") == tk.SUNKEN
+            )
+            btn = tk.Button(
+                bl, text=f"B{i}", width=3, bg=colors[i % len(colors)], fg="white",
+                relief=tk.SUNKEN if sunken else tk.RAISED,
+                command=lambda idx=i: None,
+            )
+            btn.pack(side=tk.LEFT, padx=1)
+            pop_btns.append(btn)
+
+        def toggle(idx: int):
+            self._li_toggle_byte(idx)
+            pop.copy_state_from(self._li_byte_graph)
+
+        for i, btn in enumerate(pop_btns):
+            btn.configure(command=lambda idx=i: toggle(idx))
+
+        win.bind("<Destroy>", lambda e: setattr(self, "_li_popout_window", None))
+
+    # ========================================================================
     # CAN Simulator Tab
     # ========================================================================
 
@@ -2738,6 +4134,8 @@ class YonaCanApp:
         # Stop simulation if running
         if self._sim_running_flag:
             self._stop_simulation()
+
+        self._li_scan_cancel = True
         
         if self.can_interface.is_connected:
             self.can_interface.disconnect()

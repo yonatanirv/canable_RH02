@@ -24,6 +24,7 @@
 
     - Real-time CAN frame viewing (RX/TX)
     - DBC file loading and parsed signal viewer with live graphs
+    - Offline log import viewer (CL2000 / CSV) with ISOBUS DDI dictionary
     - CAN frame transmission (single frames)
     - CAN signal simulator (sweep/static/random modes)
     - CAN bus error monitoring (TEC/REC counters)
@@ -125,6 +126,19 @@
   Load a .dbc file to see decoded signal values. Select SPNs to plot
   live graphs (up to 5 simultaneous). Supports auto-scale, manual
   Y-axis limits, adjustable time window, and start/stop per graph.
+
+  Log Import Viewer
+  -----------------
+  Analyze recorded CAN logs offline (no device connection required).
+  Supported formats:
+    - CSS Electronics CL2000 text export (.txt)
+    - YonaCan CSV logs (.csv)
+  Load a J1939 DBC for PGN/SPN names and decoding. The bundled
+  ISOBUS/isobus_ddi.json dictionary (ISO 11783-11) provides DDI
+  names and full definitions in DDI presentation mode.
+  After loading a log or changing a dictionary, a summary shows how
+  many PGNs were found and how many match the DBC / ISOBUS dictionary.
+  Select a PGN to view SPN values and graph bytes, SPNs, or browse DDIs.
 
   CAN Simulator
   -------------
