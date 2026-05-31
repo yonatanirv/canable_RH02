@@ -2,6 +2,8 @@
 
 This repository contains sources for the slcan CANable firmware, based off of the CANtact firwmare. This firmware may still compile and run on the CANtact.
 
+> **Note:** The YonaCan GUI analyzer has moved to [github.com/yonatanirv/yonacan](https://github.com/yonatanirv/yonacan).
+
 ## Supported Commands
 
 - `O` - Open channel 
